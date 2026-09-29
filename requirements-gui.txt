@@ -1,0 +1,13 @@
+# 图形界面客户端依赖（可选）
+# 本项目界面只用到 QtCore / QtGui / QtWidgets，全部包含在 PySide6-Essentials 中，
+# 不需要 PySide6 完整包（完整包还会拉入 PySide6-Addons，多下载 160+ MB 的
+# WebEngine / 3D / Charts 等用不到模块）。
+#
+# 默认选 PySide6：Qt 官方出品、LGPL 授权，打包成闭源 exe 分发没有授权顾虑。
+PySide6-Essentials==6.11.2
+
+# 如果你确实需要 WebEngine / 3D / Charts 等模块，改用完整版：
+# PySide6==6.11.2
+# 如果想要 PyQt6（GPL / 商业双授权），改用下面这行，并把 GUI 代码里的
+# PySide6 导入替换为 PyQt6：
+# PyQt6==6.11.0

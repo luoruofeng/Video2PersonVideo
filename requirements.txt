@@ -1,0 +1,39 @@
+# =============================================================================
+# Video2PersonVideo 运行期依赖（版本均为 PyPI 上最新稳定版，2026-09 核实）
+#
+# 安装顺序很重要：先装 PyTorch，再装其余依赖。
+#
+#   有 NVIDIA 显卡（CUDA 版，速度提升明显）：
+#     请到 https://pytorch.org/get-started/locally/ 复制对应 CUDA 版本的命令，例如
+#       pip install torch torchvision --index-url https://download.pytorch.org/whl/cu129
+#     然后再执行：
+#       pip install -r requirements.txt
+#
+#   无独显 / 只想用 CPU（PyPI 的 Windows 版 torch 默认就是 CPU 版）：
+#       pip install -r requirements.txt
+# =============================================================================
+
+# 深度学习底层框架（GPU 用户请按上面的说明改用 CUDA 源安装，不要删掉这两行的版本约束）
+torch==2.14.0
+torchvision==0.29.0
+
+# 目标检测：YOLO 模型加载、推理、NMS、画框、视频流处理（YOLOv8/v9/v10/v11 及更新版本）
+ultralytics==8.4.163
+
+# 视频/图像读写、帧操作、截图保存（ultralytics 内部已依赖，显式声明便于自定义画面处理）
+opencv-python==5.0.0.93
+# 若 5.x 遇到兼容问题，可回退到 4.14.0.94：
+#   pip install "opencv-python==4.14.0.94"
+
+# 数组运算（opencv / torch 都会自动安装，这里显式锁定版本）
+numpy==2.5.3
+
+# 进度条，处理视频时显示进度
+tqdm==4.70.1
+
+# 读取 YAML 配置文件
+pyyaml==6.0.3
+
+# 高级视频编码 / 音频保留：把 OpenCV 输出的无声视频与原视频音轨合并
+# 注意：这是 Python 封装库，机器上仍需安装 ffmpeg 可执行文件并加入 PATH
+ffmpeg-python==0.2.0

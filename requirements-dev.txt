@@ -1,0 +1,14 @@
+-r requirements.txt
+-r requirements-gui.txt
+
+# 测试
+pytest==9.1.1
+pytest-cov>=6.0
+
+# 代码风格 / 静态检查
+ruff==0.16.9
+
+# 打包成 Windows 独立 exe（对方无需安装 Python 环境）
+pyinstaller==6.22.3
+# PyInstaller 的可视化打包工具（可选，新手友好）
+auto-py-to-exe==2.50.1

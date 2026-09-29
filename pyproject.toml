@@ -1,0 +1,84 @@
+[build-system]
+requires = ["setuptools>=77.0.3", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "video2personvideo"
+version = "0.2.0"
+description = "基于 Ultralytics YOLO 的视频人像构图裁剪工具：以主要人物为中心裁成指定长宽比（命令行 + PySide6 向导界面）"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+keywords = ["yolo", "ultralytics", "opencv", "person-detection", "video", "pyside6"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Environment :: X11 Applications :: Qt",
+    "Intended Audience :: Developers",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+]
+
+# 运行期核心依赖。
+# torch / torchvision 不写在这里：它们需要按 GPU 情况选择不同的安装源
+# （CPU 版与 CUDA 版 wheel 不同），请先在 requirements.txt 中按需安装，
+# ultralytics 本身也会依赖它们。
+dependencies = [
+    "ultralytics==8.4.163",
+    "opencv-python==5.0.0.93",
+    "numpy==2.5.3",
+    "tqdm==4.70.1",
+    "pyyaml==6.0.3",
+    "ffmpeg-python==0.2.0",
+]
+
+[project.optional-dependencies]
+# 图形界面（二选一，默认用 PySide6：LGPL 授权，打包成 exe 分发更省心）
+# 界面只用到 QtCore/QtGui/QtWidgets，装 Essentials 即可，无需完整版 Addons
+gui = ["PySide6-Essentials==6.11.2"]
+gui-pyqt = ["PyQt6==6.11.0"]
+# 打包成 Windows 独立 exe
+build = ["pyinstaller==6.22.3", "auto-py-to-exe==2.50.1"]
+# 开发调试
+dev = ["pytest==9.1.1", "pytest-cov>=6.0", "ruff==0.16.9"]
+
+[project.scripts]
+v2pv = "video2personvideo.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/your-name/Video2PersonVideo"
+Issues = "https://github.com/your-name/Video2PersonVideo/issues"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers -m 'not slow'"
+markers = [
+    "slow: 需要下载模型/推理的慢速测试（默认跳过，用 RUN_SLOW=1 开启）",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]
