@@ -31,6 +31,7 @@ from ..utils.logger import get_logger
 from .crop import WindowSlice, compose_multi_frame
 from .framing import (
     DEFAULT_FRAMING_PARAMS,
+    DEFAULT_MIN_PERSON_HEIGHT_RATIO,
     CropBox,
     FramingParams,
     compute_upper_body_box,
@@ -121,7 +122,7 @@ class MultiPersonComposer:
         smoother_params: SmoothingParams | None = None,
         weights: SubjectWeights = DEFAULT_WEIGHTS,
         policy: MultiPersonPolicy | None = None,
-        min_person_height_ratio: float = 0.08,
+        min_person_height_ratio: float = DEFAULT_MIN_PERSON_HEIGHT_RATIO,
         annotate: bool = False,
     ) -> None:
         self.ratio = ratio
@@ -442,7 +443,7 @@ def plan_static_multi(
     *,
     params: FramingParams = DEFAULT_FRAMING_PARAMS,
     policy: MultiPersonPolicy | None = None,
-    min_person_height_ratio: float = 0.08,
+    min_person_height_ratio: float = DEFAULT_MIN_PERSON_HEIGHT_RATIO,
 ) -> list[WindowSlice] | None:
     """无时序的多人分屏规划：单帧选人 → 排窗口。
 
@@ -488,7 +489,7 @@ def compose_static_multi(
     *,
     params: FramingParams = DEFAULT_FRAMING_PARAMS,
     policy: MultiPersonPolicy | None = None,
-    min_person_height_ratio: float = 0.08,
+    min_person_height_ratio: float = DEFAULT_MIN_PERSON_HEIGHT_RATIO,
     annotate: bool = False,
 ) -> np.ndarray | None:
     """无时序的多人分屏（构图预览用）：规划 + 拼接一步到位。"""

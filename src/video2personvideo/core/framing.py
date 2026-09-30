@@ -9,6 +9,12 @@
 * 取景框宽高比恒等于目标比例（不变量 3）；
 * 只平移不缩放地夹取到画面内，绝不产生黑边（不变量 4）；
 * 取景框尺寸有上下限保护，避免极端放大或裁出畸形画面（M1-3）。
+
+**唯一例外**：画面里没有主要人物且显示方式为「全画面适配 / 全景+特写」
+（:data:`MODE_FIT` / :data:`MODE_TILES`）时不存在"取景框"这个概念 —— 此时
+:class:`CropBox` 被借用来表示"从源画面里取出的那一块"（比例会从目标比例连续
+过渡到源比例），真正的画面合成由 :mod:`~video2personvideo.core.crop` 完成。
+输出尺寸恒定（不变量 2）与"不出现黑边 / 变形 / 越界"（不变量 4）依然成立。
 """
 
 from __future__ import annotations
@@ -24,6 +30,17 @@ MODE_HALFBODY = "halfbody"
 MODE_FULLBODY = "fullbody"
 MODE_CENTER = "center"
 MODE_HOLD = "hold"
+#: 空镜巡视：画面里没有主要人物时，取景框沿"画面比取景框多出来的那一侧"缓慢往返，
+#: 把横屏素材的全部内容都带到竖屏输出里（不丢左右 / 上下两边）
+MODE_SCAN = "scan"
+#: 全画面适配：画面里没有主要人物时，把**整幅画面**等比缩小完整放进输出画布
+#: （上下 / 左右留出的部分用同一帧的模糊放大版填满），一帧看全、镜头完全不移动。
+#: 注意：这是唯一一种"取景框比例不等于目标比例"的模式（此时不存在取景框，
+#: 直接由裁剪层合成），文件末尾的不变量说明里有专门标注。
+MODE_FIT = "fit"
+#: 全景 + 特写：没有主要人物时，上方通栏放整幅画面，下方纵向排列若干"次要小人物"的
+#: 半身特写 —— 既保住环境全貌，又能看清被主角阈值过滤掉的远景人物
+MODE_TILES = "tiles"
 MODE_ANNOTATE = "annotate"
 MODE_AUTO = "auto"
 #: 多人分屏：一帧里同时显示多个人的上半身小窗口
@@ -36,6 +53,9 @@ MODE_LABELS: dict[str, str] = {
     MODE_FULLBODY: "全身",
     MODE_CENTER: "画面居中兜底",
     MODE_HOLD: "保持上一帧",
+    MODE_SCAN: "空镜巡视",
+    MODE_FIT: "全画面适配",
+    MODE_TILES: "全景+特写",
     MODE_ANNOTATE: "画框标注",
     MODE_MULTI: "多人分屏",
     MODE_AUTO: "自动",
@@ -184,8 +204,9 @@ class FramingParams:
 #: 默认构图参数
 DEFAULT_FRAMING_PARAMS = FramingParams()
 
-#: 默认主角最小高度占比（低于此值视为"没有人物"）
-DEFAULT_MIN_PERSON_HEIGHT_RATIO = 0.08
+#: 默认主角最小高度占比（低于此值视为"没有人物"）：
+#: 只有画面里占比足够大的人才算主要人物，背景中的路人 / 小人一律忽略。
+DEFAULT_MIN_PERSON_HEIGHT_RATIO = 0.73
 
 BBox = tuple[float, float, float, float]
 

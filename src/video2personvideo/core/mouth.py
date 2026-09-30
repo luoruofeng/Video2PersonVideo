@@ -17,6 +17,11 @@ COCO-17 关键点里也没有嘴部关键点）。要看嘴型只能自己动手
 
 纯几何部分（:func:`head_box_from_keypoints` / :func:`mouth_roi` / :func:`clip_roi`）
 不依赖 OpenCV、可脱离视频单测；像素运算只用 numpy。
+
+性能上有一处刻意的设计：灰度**按需换算**（:class:`FrameGray`）。整帧转灰度是一次
+float32 矩阵乘（1080p 约 20ms/帧），而真正要看的只有"嘴"和"上半脸"两块小矩形，
+所以只在用到某块矩形时才换算那一块 —— 灰度是逐像素运算，只算一块与整帧算完再切
+**逐像素相同**，但代价降到千分之几。
 """
 
 from __future__ import annotations
@@ -154,6 +159,17 @@ def to_gray(frame: np.ndarray) -> np.ndarray:
     return np.clip(gray, 0.0, 255.0).astype(np.uint8)
 
 
+def gray_roi(frame: np.ndarray, roi: ROI) -> np.ndarray:
+    """只对 ``roi`` 这一块做灰度换算。
+
+    灰度是**逐像素**运算，所以"只算这一块"与"整帧换算后切同一块"逐像素相同
+    （见 :func:`to_gray`）；但省掉了整帧的 float32 矩阵乘 —— 1080p 上约 20ms/帧，
+    而嘴部 / 参照区的实际面积通常只有画面的千分之几。
+    """
+    x, y, width, height = (int(value) for value in roi)
+    return to_gray(frame[y : y + height, x : x + width])
+
+
 def roi_motion(previous: np.ndarray, current: np.ndarray, roi: ROI, *, scale: float = 255.0) -> float:
     """区域内的帧间差分能量（0~1）：值越大说明这块像素变化越剧烈。"""
     x, y, width, height = (int(value) for value in roi)
@@ -179,6 +195,51 @@ def mouth_activity(
     """
     mouth_motion = roi_motion(previous, current, mouth)
     reference_motion = roi_motion(previous, current, reference)
+    return max(0.0, mouth_motion - float(reference_weight) * reference_motion)
+
+
+class FrameGray:
+    """一帧的「按需灰度」：每个矩形只在**第一次用到**时才做灰度换算。
+
+    与"先把整帧转成灰度、再在各处切矩形"的结果逐像素相同（灰度是按像素算的），
+    但一个人身上真正要看的只有"嘴"和"上半脸"两块小矩形，整帧换算的代价
+    （1080p 上约 20ms/帧，比 GPU 上的 YOLO 前向还贵）纯属浪费。
+
+    上一关键帧也要参与帧间差分，所以分析器保存的是**上一帧的引用**，而不是它
+    的灰度副本：基准帧上要看的矩形同样只在用到时才换算。
+    """
+
+    __slots__ = ("frame", "_patches")
+
+    def __init__(self, frame: np.ndarray) -> None:
+        self.frame = frame
+        self._patches: dict[ROI, np.ndarray] = {}
+
+    def patch(self, rect: ROI) -> np.ndarray:
+        """``rect`` 处的灰度图（只换算一次，之后走缓存）。"""
+        patch = self._patches.get(rect)
+        if patch is None:
+            patch = gray_roi(self.frame, rect)
+            self._patches[rect] = patch
+        return patch
+
+    def motion(self, other: FrameGray, rect: ROI, *, scale: float = 255.0) -> float:
+        """本帧与 ``other`` 在 ``rect`` 上的帧间差分能量（等价于整帧灰度后比同一块）。"""
+        _, _, width, height = (int(value) for value in rect)
+        return roi_motion(self.patch(rect), other.patch(rect), (0, 0, width, height), scale=scale)
+
+
+def mouth_activity_frames(
+    previous: FrameGray,
+    current: FrameGray,
+    mouth: ROI,
+    reference: ROI,
+    *,
+    reference_weight: float = 1.0,
+) -> float:
+    """:func:`mouth_activity` 的按需灰度版（数值与它逐位相同）。"""
+    mouth_motion = previous.motion(current, mouth)
+    reference_motion = previous.motion(current, reference)
     return max(0.0, mouth_motion - float(reference_weight) * reference_motion)
 
 
@@ -229,7 +290,34 @@ class FaceLocator:
         if self._cascade is None:
             return None
 
-        frame_h, frame_w = gray.shape[:2]
+        region = self._search_region(gray.shape[:2], bbox)
+        if region is None:
+            return None
+        x1, y1, span_h, x2 = region
+        return self._detect_in(gray[y1 : y1 + span_h, x1:x2], x1, y1)
+
+    def locate_bgr(self, frame: np.ndarray, bbox: BBox) -> BBox | None:
+        """与 :meth:`locate` 等价，但只对**需要搜索的那块区域**做灰度换算。
+
+        灰度是逐像素运算，所以数值与"整帧灰度后切同一块"完全相同；
+        代价却从整帧降到人物框上部的一条小区域（1080p 上约 20ms → 不到 1ms）。
+        """
+        if self._cascade is None:
+            return None
+
+        region = self._search_region(frame.shape[:2], bbox)
+        if region is None:
+            return None
+        x1, y1, span_h, x2 = region
+        return self._detect_in(
+            gray_roi(frame, (x1, y1, x2 - x1, span_h)), x1, y1
+        )
+
+    def _search_region(
+        self, frame_shape: tuple[int, ...], bbox: BBox
+    ) -> tuple[int, int, int, int] | None:
+        """人脸搜索区 ``(x1, y1, 高, x2)``；人物框太小 / 在画面外时返回 ``None``。"""
+        frame_h, frame_w = int(frame_shape[0]), int(frame_shape[1])
         x1 = max(int(round(min(bbox[0], bbox[2]))), 0)
         x2 = min(int(round(max(bbox[0], bbox[2]))), frame_w)
         y1 = max(int(round(min(bbox[1], bbox[3]))), 0)
@@ -237,8 +325,12 @@ class FaceLocator:
         span_h = int((y2 - y1) * self.search_top_ratio)
         if x2 - x1 < 8 or span_h < 8:
             return None
+        return x1, y1, span_h, x2
 
-        region = gray[y1 : y1 + span_h, x1:x2]
+    def _detect_in(
+        self, region: np.ndarray, offset_x: int, offset_y: int
+    ) -> BBox | None:
+        """在一小块灰度图里找脸，并把结果换算回画面坐标。"""
         min_side = max(16, int(region.shape[0] * self.min_face_ratio))
         try:
             faces = self._cascade.detectMultiScale(
@@ -256,10 +348,10 @@ class FaceLocator:
         # 取最大的一张：通常就是人物框上部的那颗头
         fx, fy, width, height = max(faces, key=lambda item: int(item[2]) * int(item[3]))
         return (
-            float(x1 + fx),
-            float(y1 + fy),
-            float(x1 + fx + width),
-            float(y1 + fy + height),
+            float(offset_x + fx),
+            float(offset_y + fy),
+            float(offset_x + fx + width),
+            float(offset_y + fy + height),
         )
 
 
@@ -275,10 +367,11 @@ class MouthActivityAnalyzer:
     reference_weight: float = 1.0
     face_locator: FaceLocator | None = field(default=None)
     fallback_ratio: bool = True
-    _previous_gray: np.ndarray | None = field(default=None, init=False, repr=False)
+    #: 上一帧（只留引用，用到哪块才换算哪块的灰度，见 :class:`FrameGray`）
+    _previous_frame: FrameGray | None = field(default=None, init=False, repr=False)
 
     def reset(self) -> None:
-        self._previous_gray = None
+        self._previous_frame = None
 
     def activity(
         self,
@@ -286,15 +379,19 @@ class MouthActivityAnalyzer:
         bboxes: list[BBox],
         keypoints: list[Keypoints | None] | None = None,
     ) -> list[float]:
-        """返回与 ``bboxes`` 等长的嘴动强度列表（0 表示"测不出来"，不参与投票）。"""
-        gray = to_gray(frame)
-        previous = self._previous_gray
-        self._previous_gray = gray
+        """返回与 ``bboxes`` 等长的嘴动强度列表（0 表示"测不出来"，不参与投票）。
+
+        整帧灰度换算已改成**按需**（只算嘴部 / 上半脸 / 人脸搜索区那几小块），
+        返回值与旧版逐位相同；即使 ``bboxes`` 为空（只是推进基准帧）也几乎零开销。
+        """
+        current = FrameGray(frame)
+        previous = self._previous_frame
+        self._previous_frame = current
 
         if previous is None or not bboxes:
             return [0.0] * len(bboxes)
 
-        frame_size = (float(gray.shape[1]), float(gray.shape[0]))
+        frame_size = (float(frame.shape[1]), float(frame.shape[0]))
         values: list[float] = []
         for position, bbox in enumerate(bboxes):
             points = (
@@ -302,21 +399,21 @@ class MouthActivityAnalyzer:
                 if keypoints is not None and position < len(keypoints)
                 else None
             )
-            values.append(self._one(previous, gray, bbox, points, frame_size))
+            values.append(self._one(previous, current, bbox, points, frame_size))
         return values
 
     # ------------------------------------------------------------- 内部逻辑
     def _one(
         self,
-        previous: np.ndarray,
-        current: np.ndarray,
+        previous: FrameGray,
+        current: FrameGray,
         bbox: BBox,
         keypoints: Keypoints | None,
         frame_size: tuple[float, float],
     ) -> float:
         head = head_box_from_keypoints(keypoints, bbox)
         if head is None and self.face_locator is not None:
-            head = self.face_locator.locate(current, bbox)
+            head = self._locate_face(current.frame, bbox)
         if head is None and self.fallback_ratio:
             head = fallback_head_box(bbox, frame_size)
         if head is None:
@@ -326,6 +423,18 @@ class MouthActivityAnalyzer:
         reference = clip_roi(reference_roi(head), frame_size)
         if mouth is None or reference is None:
             return 0.0
-        return mouth_activity(
+        return mouth_activity_frames(
             previous, current, mouth, reference, reference_weight=self.reference_weight
         )
+
+    def _locate_face(self, frame: np.ndarray, bbox: BBox) -> BBox | None:
+        """找人脸：优先走"只灰度搜索区"的快速路径。
+
+        自定义定位器（鸭子类型）只实现了 ``locate(gray, bbox)`` 时退回整帧灰度，
+        行为与以前一致。
+        """
+        assert self.face_locator is not None
+        locate_bgr = getattr(self.face_locator, "locate_bgr", None)
+        if callable(locate_bgr):
+            return locate_bgr(frame, bbox)
+        return self.face_locator.locate(to_gray(frame), bbox)

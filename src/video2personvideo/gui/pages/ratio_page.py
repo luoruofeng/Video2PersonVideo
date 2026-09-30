@@ -16,16 +16,21 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ...core.framing import DEFAULT_FRAMING_PARAMS
+from ...core.framing import DEFAULT_FRAMING_PARAMS, DEFAULT_MIN_PERSON_HEIGHT_RATIO
 from ...core.ratio import PRESET_RATIOS, AspectRatio
 from ...core.smoothing import (
     CAMERA_PRESETS,
     DEFAULT_CAMERA_PRESET,
+    DEFAULT_NO_PERSON_MODE,
+    NO_PERSON_DESCRIPTIONS,
+    NO_PERSON_LABELS,
+    NO_PERSON_MODES,
     PRESET_FIELDS,
     match_preset,
     preset_values,
 )
 from .. import theme
+from ..framing_sketch import FramingSketch
 from ..ratio_dialog import RatioDialog
 from ..ratio_grid import RatioGrid, make_ratio_icon
 
@@ -40,8 +45,8 @@ FOLLOW_TOOLTIP = (
     "人物走动时镜头怎么跟（越靠上的档位越稳、越不容易看晕）：\n"
     "· 锁定：人物在画面内走动时镜头完全不动，只有快走出画面时才缓慢平移\n"
     "· 舒缓：镜头偶尔缓慢平移，人物可在画面内较自由地走动\n"
-    "· 标准：默认，镜头较少移动、人物基本居中\n"
-    "· 跟手：镜头跟得紧，画面运动感强\n"
+    "· 标准：镜头较少移动、人物基本居中\n"
+    "· 跟手：默认，镜头跟得紧，画面运动感强\n"
     "· 自定义：在「预览构图效果」里细调过平滑参数"
 )
 
@@ -55,6 +60,15 @@ MULTI_PERSON_TOOLTIP = (
     "  按「输出比例 + 人数」查表决定，可自行修改\n"
     "· 背景里的小人 / 路人不算主要人物，不会进窗口\n"
     "· 单人画面不受影响：输出与关闭该功能时完全一致"
+)
+
+#: 「无人物显示」下拉的提示语
+NO_PERSON_TOOLTIP = (
+    "画面里没有主要人物时（人都走开了、只有空镜）这一段怎么显示。\n"
+    "无论选哪一档，都会先从人物的取景框平缓过渡过去，不会突然一跳。\n"
+    + "\n".join(
+        f"· {NO_PERSON_LABELS[mode]}：{NO_PERSON_DESCRIPTIONS[mode]}" for mode in NO_PERSON_MODES
+    )
 )
 
 
@@ -113,10 +127,26 @@ class RatioPage(QWidget):
         self._set_follow(DEFAULT_CAMERA_PRESET)
         self.set_ratio(PRESET_RATIOS[1])
 
+        # 任一构图参数变化 → 立刻重画示意图，让用户直接看到改动效果
+        self.tuningChanged.connect(self._refresh_sketch)
+        self.ratioChanged.connect(lambda _ratio: self._refresh_sketch())
+        self._refresh_sketch()
+
     # ------------------------------------------------------------- 子控件
     def _build_tuning_group(self) -> QGroupBox:
         group = QGroupBox("构图参数（可选微调）")
-        form = QFormLayout(group)
+        outer = QVBoxLayout(group)
+        outer.setSpacing(theme.SPACING)
+
+        # 参数效果示意图：改动下面任一参数都会即时重画（纯几何，不读视频）
+        self.sketch = FramingSketch()
+        outer.addWidget(self.sketch)
+        self.sketch_caption = QLabel()
+        self.sketch_caption.setObjectName("hint")
+        self.sketch_caption.setWordWrap(True)
+        outer.addWidget(self.sketch_caption)
+
+        form = QFormLayout()
         form.setSpacing(theme.SPACING_SMALL)
 
         self.follow_combo = QComboBox()
@@ -127,8 +157,12 @@ class RatioPage(QWidget):
         self.follow_combo.currentIndexChanged.connect(self._on_follow_changed)
         form.addRow("镜头跟随", self.follow_combo)
 
-        self.min_person_slider, person_row = self._make_slider(1, 60, 8)
-        self.min_person_slider.setToolTip("人物最小占比：低于该高度占比的人物视为不存在")
+        min_person_default = int(round(DEFAULT_MIN_PERSON_HEIGHT_RATIO * 100))
+        self.min_person_slider, person_row = self._make_slider(1, 90, min_person_default)
+        self.min_person_slider.setToolTip(
+            "人物最小占比：低于该高度占比的人物视为不存在（背景里的路人 / 小人）。\n"
+            "默认 0.73 = 只把画面里占比很大的人当主要人物，往小调可放回更多小人。"
+        )
         form.addRow("人物最小占比", person_row)
 
         headroom_default = int(round(DEFAULT_FRAMING_PARAMS.headroom * 100))
@@ -141,6 +175,13 @@ class RatioPage(QWidget):
         self.multi_person_box.setToolTip(MULTI_PERSON_TOOLTIP)
         self.multi_person_box.stateChanged.connect(lambda _: self.tuningChanged.emit())
         form.addRow("多人分屏", self.multi_person_box)
+
+        self.no_person_combo = QComboBox()
+        self.no_person_combo.setToolTip(NO_PERSON_TOOLTIP)
+        for mode in NO_PERSON_MODES:
+            self.no_person_combo.addItem(NO_PERSON_LABELS[mode], mode)
+        self.no_person_combo.currentIndexChanged.connect(lambda _: self.tuningChanged.emit())
+        form.addRow("没有人物时", self.no_person_combo)
 
         self.speaker_box = QCheckBox("优先对准正在说话的人")
         self.speaker_box.setChecked(True)
@@ -167,6 +208,7 @@ class RatioPage(QWidget):
         self.preview_button.setToolTip("抽取若干采样帧，先看裁剪效果再决定是否全量处理")
         self.preview_button.clicked.connect(self.previewRequested.emit)
         form.addRow("", self.preview_button)
+        outer.addLayout(form)
         return group
 
     def _make_slider(self, minimum: int, maximum: int, value: int) -> tuple[QSlider, QWidget]:
@@ -262,6 +304,18 @@ class RatioPage(QWidget):
     def set_multi_person(self, enabled: bool) -> None:
         self.multi_person_box.setChecked(bool(enabled))
 
+    def no_person_mode(self) -> str:
+        """没有主要人物时的显示方式（``fit`` / ``tiles`` / ``scan`` / ``center``）。"""
+        return str(self.no_person_combo.currentData())
+
+    def set_no_person_mode(self, mode: str) -> None:
+        index = self.no_person_combo.findData(str(mode))
+        if index < 0:
+            index = self.no_person_combo.findData(DEFAULT_NO_PERSON_MODE)
+        if index >= 0 and index != self.no_person_combo.currentIndex():
+            self.no_person_combo.setCurrentIndex(index)
+            self.tuningChanged.emit()
+
     # ------------------------------------------------------------- 内部逻辑
     def _on_follow_changed(self) -> None:
         key = self.follow_key()
@@ -288,6 +342,37 @@ class RatioPage(QWidget):
             f"预估输出分辨率：{ratio.target_width} × {ratio.target_height}"
         )
         self.preview_icon.setPixmap(make_ratio_icon(ratio, PREVIEW_ICON_SIZE).pixmap(PREVIEW_ICON_SIZE))
+
+    def _refresh_sketch(self) -> None:
+        """把当前参数交给示意图重画，并用一句话说明它们的效果。"""
+        self.sketch.configure(
+            ratio=self.current_ratio(),
+            min_person_ratio=self.min_person_slider.value() / 100.0,
+            headroom=self.headroom_slider.value() / 100.0,
+            follow_key=self.follow_key(),
+            multi_person=self.multi_person(),
+            no_person_mode=self.no_person_mode(),
+        )
+        self.sketch_caption.setText(self._sketch_caption())
+
+    def _sketch_caption(self) -> str:
+        """示意图下方的白话说明：每个参数在做什么、往哪调会怎样。"""
+        min_ratio = self.min_person_slider.value() / 100.0
+        headroom = self.headroom_slider.value() / 100.0
+        key = self.follow_key()
+        label = CAMERA_PRESETS[key].label if key in CAMERA_PRESETS else "自定义"
+        multi = (
+            "橙色编号框 = 多人分屏时每人一个小窗口。"
+            if self.multi_person()
+            else "「多人分屏」已关闭，只跟一位主角。"
+        )
+        mode = self.no_person_mode()
+        return (
+            f"最小占比 {min_ratio:.2f}：比虚线更矮的人算背景，会被忽略；"
+            f"头顶留白 {headroom:.2f}：半身时头顶到画面上沿的距离，越大头顶越空、人越小；"
+            f"镜头跟随「{label}」：曲线越平 = 画面越稳；"
+            f"没有人时「{NO_PERSON_LABELS[mode]}」：{NO_PERSON_DESCRIPTIONS[mode]}。{multi}"
+        )
 
     def _open_dialog(self) -> None:
         dialog = RatioDialog(self.current_ratio(), self)

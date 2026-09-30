@@ -74,6 +74,7 @@ class WizardWindow(QMainWindow):
         self.ratio_page.set_size_guard(self._base_cfg.size_guard)
         self.ratio_page.set_speaker_tracking(self._base_cfg.speaker_tracking)
         self.ratio_page.set_multi_person(self._base_cfg.multi_person)
+        self.ratio_page.set_no_person_mode(self._base_cfg.no_person_mode)
 
         self.stack = QStackedWidget()
         for page in (self.input_page, self.ratio_page, self.run_page, self.result_page):
@@ -205,6 +206,7 @@ class WizardWindow(QMainWindow):
             size_guard=self.ratio_page.size_guard(),
             speaker_tracking=self.ratio_page.speaker_tracking(),
             multi_person=self.ratio_page.multi_person(),
+            no_person_mode=self.ratio_page.no_person_mode(),
             show=False,
             **tuning,
         )
@@ -310,6 +312,7 @@ class WizardWindow(QMainWindow):
         if dialog.exec():
             self.ratio_page.set_tuning(dialog.tuning())
             self.ratio_page.set_multi_person(dialog.multi_person())
+            self.ratio_page.set_no_person_mode(dialog.no_person_mode())
             QMessageBox.information(self, "已应用", "预览参数已同步到设置，可以开始处理了。")
 
     # ----------------------------------------------------------- 环境自检
@@ -335,6 +338,8 @@ class WizardWindow(QMainWindow):
             # 用 contains 判断"有没有记忆过"：直接把默认值写成 None 会被 Qt 转成 False
             has_multi_person = bool(settings.contains("multi/person"))
             multi_person = bool(settings.value("multi/person", True, type=bool))
+            has_no_person = bool(settings.contains("noPerson/mode"))
+            no_person_mode = str(settings.value("noPerson/mode", "", type=str))
         except Exception as exc:  # noqa: BLE001 - 没有配置后端时忽略
             logger.debug("读取界面记忆失败：%s", exc)
             return
@@ -348,6 +353,8 @@ class WizardWindow(QMainWindow):
         # 没记忆过就沿用配置默认值（默认开启），只覆盖用户真正选过的
         if has_multi_person:
             self.ratio_page.set_multi_person(multi_person)
+        if has_no_person and no_person_mode:
+            self.ratio_page.set_no_person_mode(no_person_mode)
 
         if ratio_name:
             try:
@@ -366,6 +373,7 @@ class WizardWindow(QMainWindow):
             settings.setValue("ratio/width", ratio.target_width)
             settings.setValue("ratio/height", ratio.target_height)
             settings.setValue("multi/person", self.ratio_page.multi_person())
+            settings.setValue("noPerson/mode", self.ratio_page.no_person_mode())
             settings.sync()
         except Exception as exc:  # noqa: BLE001
             logger.debug("保存界面记忆失败：%s", exc)

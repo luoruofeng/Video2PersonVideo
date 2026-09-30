@@ -19,7 +19,7 @@ from .detector import PersonDetector
 from .framing import MODE_ANNOTATE, CropBox, mode_label
 from .mouth import FaceLocator, MouthActivityAnalyzer
 from .pipeline import CropPipeline, FrameOutcome
-from .smoothing import BoxSmoother
+from .smoothing import BoxSmoother, no_person_mode_description, no_person_mode_label
 from .speaker import ActiveSpeakerSelector
 from .video_io import VideoReader, VideoWriter, save_frame_image
 
@@ -79,6 +79,16 @@ class ProcessResult:
     crop_mode: bool = False
     hold_frames: int = 0
     center_frames: int = 0
+    #: 以「空镜巡视」输出的帧数（无人画面里缓慢平移、扫过被居中裁剪掉的那部分）
+    scan_frames: int = 0
+    #: 以「全画面适配」输出的帧数（无人画面里整幅画面缩小放入，镜头不动）
+    fit_frames: int = 0
+    #: 以「全景 + 特写」输出的帧数（无人画面里全景 + 远景小人物特写）
+    tiles_frames: int = 0
+    #: 无主要人物时的显示方式（fit / tiles / scan / center）
+    no_person_mode: str = ""
+    #: 无人物显示的状态说明（无论是否真的用上都会给出原因）
+    no_person_note: str = ""
     mode_counts: dict[str, int] = field(default_factory=dict)
     #: 原视频 / 输出视频的体积（字节），取不到时分别为 0
     source_bytes: int = 0
@@ -177,10 +187,27 @@ class ProcessResult:
                     f"体积守护     : 已自动压缩但仍大于原视频（{before}"
                     f"{format_bytes(self.output_bytes)}，已到最低码率无法再小）"
                 )
-        if self.crop_mode and (self.hold_frames or self.center_frames):
-            lines.append(
-                f"兜底帧数     : 保持上一帧 {self.hold_frames} 帧 / 回中 {self.center_frames} 帧"
-            )
+        if self.crop_mode and (
+            self.hold_frames
+            or self.scan_frames
+            or self.center_frames
+            or self.fit_frames
+            or self.tiles_frames
+        ):
+            fallbacks = []
+            if self.hold_frames:
+                fallbacks.append(f"保持上一帧 {self.hold_frames} 帧")
+            if self.fit_frames:
+                fallbacks.append(f"全画面适配 {self.fit_frames} 帧")
+            if self.tiles_frames:
+                fallbacks.append(f"全景+特写 {self.tiles_frames} 帧")
+            if self.scan_frames:
+                fallbacks.append(f"空镜巡视 {self.scan_frames} 帧")
+            if self.center_frames:
+                fallbacks.append(f"回中 {self.center_frames} 帧")
+            lines.append(f"兜底帧数     : {' / '.join(fallbacks)}")
+        if self.crop_mode and self.no_person_note:
+            lines.append(f"无人物显示   : {self.no_person_note}")
         if self.crop_mode and self.speaker_note:
             detail = ""
             if self.speaker_tracking:
@@ -211,6 +238,25 @@ class ProcessResult:
         if self.stopped_early:
             lines.append("提示         : 处理被提前终止，输出视频为已处理部分的截断结果")
         return "\n".join(lines)
+
+
+def build_detector(cfg: AppConfig) -> PersonDetector:
+    """按配置构造 YOLO 检测器（加载权重 + 初始化推理器）。
+
+    批处理时应当**只调用一次并复用同一个实例**：权重加载、推理器构建、GPU 上
+    还要建 CUDA 上下文 / 选卷积算法，每个视频重来一遍就是几秒钟的纯浪费，
+    而它对检测结果没有任何影响（同一个模型、同一份参数）。
+    """
+    return PersonDetector(
+        model=cfg.model,
+        conf=cfg.conf,
+        iou=cfg.iou,
+        imgsz=cfg.imgsz,
+        classes=cfg.classes or None,
+        max_det=cfg.max_det,
+        device=cfg.device,
+        use_keypoints=cfg.use_keypoints,
+    )
 
 
 def process_video(
@@ -267,22 +313,18 @@ def process_video(
     final_video = output.with_name(f"{output.stem}.encoded{output.suffix}")
 
     if detector is None:
-        detector = PersonDetector(
-            model=cfg.model,
-            conf=cfg.conf,
-            iou=cfg.iou,
-            imgsz=cfg.imgsz,
-            classes=cfg.classes or None,
-            max_det=cfg.max_det,
-            device=cfg.device,
-            use_keypoints=cfg.use_keypoints,
-        )
+        detector = build_detector(cfg)
 
     ratio = cfg.resolve_ratio() if cfg.crop else None
     pipeline: CropPipeline | None = None
     if ratio is not None:
         multi_policy = cfg.multi_person_policy()
         logger.info("多人分屏：%s", multi_policy.describe())
+        logger.info(
+            "无人物显示：%s（%s）",
+            no_person_mode_label(cfg.no_person_mode),
+            cfg.no_person_display().describe(),
+        )
         pipeline = CropPipeline(
             ratio,
             detector,
@@ -295,6 +337,7 @@ def process_video(
             crop=True,
             annotate=cfg.annotate,
             multi=multi_policy,
+            no_person=cfg.no_person_display(),
         )
 
     # 先探测源视频的音频 / 视频信息：可变帧率（VFR）时把画面归一到恒定帧率，
@@ -463,6 +506,11 @@ def process_video(
         crop_mode=pipeline is not None,
         hold_frames=pipeline.hold_frames if pipeline is not None else 0,
         center_frames=pipeline.center_frames if pipeline is not None else 0,
+        scan_frames=pipeline.scan_frames if pipeline is not None else 0,
+        fit_frames=pipeline.fit_frames if pipeline is not None else 0,
+        tiles_frames=pipeline.tiles_frames if pipeline is not None else 0,
+        no_person_mode=pipeline.no_person_mode if pipeline is not None else "",
+        no_person_note=_describe_no_person(pipeline),
         mode_counts=pipeline.stats.as_dict() if pipeline is not None else {},
         source_bytes=_file_size(source),
         output_bytes=_file_size(output),
@@ -556,6 +604,35 @@ def _describe_multi(pipeline: CropPipeline | None, frames: int) -> str:
     if frames > 0:
         return "已启用（多个主要人物各占一个上半身小窗口）"
     return "已启用（本片未出现多个主要人物，画面与单人模式一致）"
+
+
+def _describe_no_person(pipeline: CropPipeline | None) -> str:
+    """无人物显示的状态说明（无论是否真的用上，都给出原因）。
+
+    和多人分屏一样，这一项只影响"画面里没有主要人物"的那些帧；
+    说清"为什么没看到效果"比只报一句"已启用"更有用。
+    """
+    if pipeline is None:
+        return "未启用（画框标注模式）"
+    mode = pipeline.no_person_mode
+    label = no_person_mode_label(mode)
+    description = no_person_mode_description(mode)
+    detail = f"{label}（{description}）" if description else label
+
+    fit_frames = pipeline.fit_frames
+    tiles_frames = pipeline.tiles_frames
+    if mode == "tiles" and not tiles_frames:
+        if fit_frames:
+            return (
+                f"{detail}，已用 {fit_frames} 帧 —— 但画面里没有够大的远景小人物，"
+                "实际按全画面适配显示"
+            )
+        return f"{detail}（本片没有出现'超时无人'的帧，画面与跟人时一致）"
+    if fit_frames or tiles_frames:
+        return f"{detail}，本片共 {fit_frames + tiles_frames} 帧"
+    if mode in ("fit", "tiles"):
+        return f"{detail}（本片没有出现'超时无人'的帧，画面与跟人时一致）"
+    return detail
 
 
 def _estimate_frame_count(source: Path, meta) -> int:

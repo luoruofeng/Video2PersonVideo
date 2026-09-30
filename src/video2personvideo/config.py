@@ -19,8 +19,17 @@ from .core.layout import (
     MultiPersonPolicy,
     load_multi_person_policy,
 )
+from .core.noperson import (
+    DEFAULT_SECONDARY_PERSON_RATIO,
+    DEFAULT_TILES_MAX,
+    NoPersonDisplay,
+)
 from .core.ratio import DEFAULT_RATIO_NAME, AspectRatio, resolve_ratio
-from .core.smoothing import SmoothingParams
+from .core.smoothing import (
+    DEFAULT_NO_PERSON_SECONDS,
+    NO_PERSON_MODES,
+    SmoothingParams,
+)
 from .core.speaker import DEFAULT_SPEAKER_PARAMS, SpeakerParams
 from .core.subject import DEFAULT_WEIGHTS, SubjectWeights
 from .utils.logger import get_logger
@@ -59,6 +68,7 @@ _INT_FIELDS = (
     "speaker_window_frames",
     "speaker_switch_hold",
     "multi_person_max",
+    "no_person_tiles_max",
 )
 _FLOAT_FIELDS = (
     "conf",
@@ -77,6 +87,9 @@ _FLOAT_FIELDS = (
     "smoothing_zoom_deadzone",
     "smoothing_max_speed",
     "smoothing_accel",
+    "smoothing_scan_seconds",
+    "no_person_seconds",
+    "no_person_secondary_ratio",
     "max_size_ratio",
     "subject_area_weight",
     "subject_center_weight",
@@ -102,6 +115,7 @@ _BOOL_FIELDS = (
     "use_keypoints",
     "speaker_tracking",
     "multi_person",
+    "no_person_blur",
 )
 _BOOL_TRUE = {"1", "true", "yes", "y", "on", "是", "开"}
 _BOOL_FALSE = {"0", "false", "no", "n", "off", "否", "关"}
@@ -162,8 +176,9 @@ class AppConfig:
     target_height: int | None = None
 
     # ------------------------------------------------- M1-2：主角选择
-    #: 人物过小阈值：bbox 高度 < 画面高度该比例时视为无人物
-    min_person_height_ratio: float = 0.08
+    #: 人物过小阈值：bbox 高度 < 画面高度该比例时视为无人物。
+    #: 默认 0.73 只把"画面里占比很大的人"当主要人物，背景里的路人 / 小人被忽略。
+    min_person_height_ratio: float = 0.73
     subject_area_weight: float = DEFAULT_WEIGHTS.area
     subject_center_weight: float = DEFAULT_WEIGHTS.center
     subject_continuity_weight: float = DEFAULT_WEIGHTS.continuity
@@ -213,20 +228,45 @@ class AppConfig:
 
     # ------------------------------------------------- M1-4：时序平滑
     #: 取景框中心点的 EMA 系数（越大越跟手、越小越稳）
-    smoothing_alpha: float = 0.25
+    #: 默认值与「跟手」档一致
+    smoothing_alpha: float = 0.45
     #: 自由活动区（相对取景框边长）：人物在框内走动时镜头**完全不动**，
     #: 超过它之后镜头也只把人物推回边界，不会拽回画面正中 —— 这是缓解
     #: "人动镜头就动"（画面整体流动导致头晕）最有效的一项
-    smoothing_deadzone: float = 0.15
+    smoothing_deadzone: float = 0.06
     #: 缩放（推拉）的 EMA 系数：比平移更慢，抑制"呼吸式变焦"
-    smoothing_zoom_alpha: float = 0.08
+    smoothing_zoom_alpha: float = 0.15
     #: 缩放死区（相对取景框高度）
-    smoothing_zoom_deadzone: float = 0.10
+    smoothing_zoom_deadzone: float = 0.05
     #: 平移速度上限（相对框长 / 帧）：避免甩镜；0 = 不限制
-    smoothing_max_speed: float = 0.025
+    smoothing_max_speed: float = 0.05
     #: 加速平滑 (0, 1]：越小起步越柔和，1 = 不限制加速度
     smoothing_accel: float = 0.5
+    #: 丢失目标后保持上一帧取景框的最大帧数
     hold_frames: int = 30
+    #: 空镜巡视的单程时长（秒）：只有显示方式为 ``scan`` 时才用得上。
+    #: 取景框从中线性地平移扫过整幅画面，而不是直接居中 —— 直接居中会一次性丢掉
+    #: 左右（或上下）约三分之二的内容。越大越慢越舒缓；0 = 关闭巡视，退回画面居中。
+    smoothing_scan_seconds: float = 12.0
+
+    # ------------------------------------------------- 无人物帧怎么显示
+    #: 画面里没有主要人物（且超出保持帧数）时怎么显示：
+    #:   ``fit``    全画面适配（默认）：整幅画面等比缩小完整放进画布，一帧看全、
+    #:              镜头完全不移动；空出来的部分用同一帧的模糊放大版填满；
+    #:   ``tiles``  全景 + 特写：整幅画面收进上方通栏，下面纵向排列几个"次要小人物"
+    #:              （被 min_person_height_ratio 过滤掉的远景人物）的上半身特写；
+    #:   ``scan``   空镜巡视：取景框缓慢平移扫过整幅画面（任一时刻只看得到局部）；
+    #:   ``center`` 画面居中裁剪：最保守的一档。
+    #: 无论哪一种，从"人物取景框"切换过去都是平滑过渡的（见 no_person_seconds）。
+    no_person_mode: str = "fit"
+    #: 从"人物取景框"过渡到无人物显示的时长（秒）：越大越舒缓，0 = 立即切换
+    no_person_seconds: float = DEFAULT_NO_PERSON_SECONDS
+    #: 无人物画面的底色是否用"同一帧的模糊放大版"（比纯色 / 黑边自然得多）
+    no_person_blur: bool = True
+    #: 「全景 + 特写」最多给几个小人物开特写窗口（1~4）
+    no_person_tiles_max: int = DEFAULT_TILES_MAX
+    #: 「次要小人物」的高度下限（占画面比例）：低于它的不给特写（放大了也只是马赛克）
+    no_person_secondary_ratio: float = DEFAULT_SECONDARY_PERSON_RATIO
 
     # ------------------------------------------------- M1-7：性能
     #: 每 N 帧做一次 YOLO 推理，中间帧线性插值（默认 1 = 逐帧推理）
@@ -287,6 +327,9 @@ class AppConfig:
             kwargs["model"] = str(kwargs["model"])
         if kwargs.get("aspect_ratio") is not None:
             kwargs["aspect_ratio"] = str(kwargs["aspect_ratio"]).strip() or DEFAULT_RATIO_NAME
+        if kwargs.get("no_person_mode") is not None:
+            # 允许写成 Fit / FIT / " 全画面适配 " 之类的形式，统一成小写模式名
+            kwargs["no_person_mode"] = str(kwargs["no_person_mode"]).strip().lower() or "fit"
         if "output_suffix" in kwargs:
             suffix = kwargs["output_suffix"]
             kwargs["output_suffix"] = None if _is_null(suffix) else _normalize_suffix(str(suffix))
@@ -352,6 +395,17 @@ class AppConfig:
             max_speed=float(self.smoothing_max_speed),
             accel=float(self.smoothing_accel),
             hold_frames=int(self.hold_frames),
+            scan_seconds=float(self.smoothing_scan_seconds),
+            no_person_mode=str(self.no_person_mode),
+            no_person_seconds=float(self.no_person_seconds),
+        )
+
+    def no_person_display(self) -> NoPersonDisplay:
+        """构造"无人物帧长什么样"的外观参数（配合 ``smoothing_params().no_person_mode``）。"""
+        return NoPersonDisplay(
+            blur=bool(self.no_person_blur),
+            tiles_max=int(self.no_person_tiles_max),
+            secondary_ratio=float(self.no_person_secondary_ratio),
         )
 
     def subject_weights(self) -> SubjectWeights:
@@ -462,6 +516,32 @@ class AppConfig:
             )
         # 布局文件提前解析一次：配置写错（网格不合法 / 人数与格子数不符）在这里就报出来
         self.multi_person_policy()
+
+        # 无人物帧的显示方式：模式由 SmoothingParams 统一校验，这里管其余几项
+        mode = str(self.no_person_mode).strip().lower()
+        if mode not in NO_PERSON_MODES:
+            raise ValueError(
+                f"no_person_mode 只能是 {' / '.join(NO_PERSON_MODES)}，当前为 {self.no_person_mode!r}"
+            )
+        if not 1 <= int(self.no_person_tiles_max) <= 4:
+            raise ValueError(
+                f"no_person_tiles_max 必须在 [1, 4] 区间内（再多，竖屏里每格就只剩一条），"
+                f"当前为 {self.no_person_tiles_max}"
+            )
+        if not 0.0 <= float(self.no_person_secondary_ratio) < 1.0:
+            raise ValueError(
+                f"no_person_secondary_ratio 必须在 [0, 1) 区间内，"
+                f"当前为 {self.no_person_secondary_ratio}"
+            )
+        if mode == "tiles" and float(self.no_person_secondary_ratio) >= float(
+            self.min_person_height_ratio
+        ):
+            logger.warning(
+                "no_person_secondary_ratio（%.2f）不小于 min_person_height_ratio（%.2f），"
+                "「全景 + 特写」将没有可特写的人物，等价于全画面适配",
+                float(self.no_person_secondary_ratio),
+                float(self.min_person_height_ratio),
+            )
 
 
 def _is_null(value: Any) -> bool:

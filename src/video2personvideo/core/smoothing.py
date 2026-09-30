@@ -25,7 +25,21 @@
 切片不越界（不变量 4）、输出尺寸恒定（不变量 2）。
 
 丢失保持（兜底第一级）：短暂丢失目标（遮挡 / 转头）时沿用上一帧取景框，
-最多 ``hold_frames`` 帧；超时后平滑过渡到画面中心的等比取景框。
+最多 ``hold_frames`` 帧。
+
+超时后仍然没有主要人物，就按 :data:`NO_PERSON_MODES` 里选定的方式显示（兜底第二级）：
+
+* ``fit``（默认）**全画面适配**：把整幅画面等比缩小、完整放进输出画布，空出来的
+  部分由裁剪层用同一帧的模糊放大版填满 —— 一帧看全、镜头**完全不移动**。
+  从"人物取景框"到"整幅画面"用 ``no_person_seconds`` 秒平缓拉远（缓入缓出）；
+* ``tiles`` **全景 + 特写**：整幅画面收进上方通栏，下方纵向排列若干"次要小人物"
+  的半身特写 —— 既要环境全貌，也要看清被主角阈值过滤掉的远景人物；
+* ``scan`` **空镜巡视**：取景框沿"画面比取景框多出来的那一侧"缓慢往返，
+  用几个来回把整幅画面看完（任一时刻只看到局部，且画面一直在动）；
+* ``center`` **画面居中**：直接取画面正中的等比取景框（最保守的一档）。
+
+巡视没有可移动的空间（源比例与目标比例一致）、或该方式被关闭时，
+同样退回画面居中的等比取景框（兜底第三级）。
 """
 
 from __future__ import annotations
@@ -33,8 +47,55 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, replace
 
-from .framing import MODE_CENTER, MODE_HOLD, CropBox, center_box
+from .framing import (
+    MODE_CENTER,
+    MODE_FIT,
+    MODE_HOLD,
+    MODE_LABELS,
+    MODE_SCAN,
+    MODE_TILES,
+    CropBox,
+    center_box,
+)
+from .layout import TransitionFrame, fit_rect, transition_frame
 from .ratio import AspectRatio
+
+#: 画面里没有主要人物时的显示方式（``SmoothingParams.no_person_mode``）：
+#: ``fit`` 全画面适配 / ``tiles`` 全景+特写 / ``scan`` 空镜巡视 / ``center`` 画面居中
+NO_PERSON_MODES: tuple[str, ...] = (MODE_FIT, MODE_TILES, MODE_SCAN, MODE_CENTER)
+
+#: 显示方式 → 展示名（与 :data:`~video2personvideo.core.framing.MODE_LABELS` 同一份文案）
+NO_PERSON_LABELS: dict[str, str] = {mode: MODE_LABELS[mode] for mode in NO_PERSON_MODES}
+
+#: 显示方式 → 一句话说明（日志 / 汇总 / GUI 提示共用，说清"看不到什么、代价是什么"）
+NO_PERSON_DESCRIPTIONS: dict[str, str] = {
+    MODE_FIT: "整幅画面等比缩小完整放入，镜头不动、一帧看全",
+    MODE_TILES: "整幅画面收进上方通栏，下方给远景小人物开半身特写窗口",
+    MODE_SCAN: "取景框缓慢扫过整幅画面，任一时刻只看得到局部",
+    MODE_CENTER: "只取画面正中，两侧 / 上下的内容被裁掉",
+}
+
+#: 默认的无人物显示方式（一帧看全、零运动，最不容易看晕）
+DEFAULT_NO_PERSON_MODE = MODE_FIT
+
+#: 无人物过渡的默认时长（秒）：从"人物取景框"平缓拉远到"全画面适配"用多久
+DEFAULT_NO_PERSON_SECONDS = 0.8
+
+
+def no_person_mode_label(mode: str) -> str:
+    """显示方式 → 展示名（未知取值原样返回）。"""
+    key = str(mode).strip().lower()
+    return NO_PERSON_LABELS.get(key, str(mode))
+
+
+def no_person_mode_description(mode: str) -> str:
+    """显示方式 → 一句话说明（未知取值返回空串）。"""
+    return NO_PERSON_DESCRIPTIONS.get(str(mode).strip().lower(), "")
+
+
+def no_person_choices() -> list[tuple[str, str]]:
+    """``[(模式, 展示名), ...]``，顺序即 GUI 下拉 / 文档的展示顺序。"""
+    return [(mode, NO_PERSON_LABELS[mode]) for mode in NO_PERSON_MODES]
 
 #: 追赶系数：目标偏离每增加"一个框长"，平移速度上限就放宽这么多倍基准值。
 #: 保证人物快走出画面时镜头跟得上；日常小幅移动受速度上限保护，不会甩镜。
@@ -50,25 +111,46 @@ MAX_SPEED_FACTOR = 4.0
 #: 素材（24 / 25 / 30 / 50 / 60fps）看到的是**同样的镜头运动速度**。
 REFERENCE_FPS = 30.0
 
+#: 空镜巡视时，可平移空间小于这么多个像素就认为"源比例已与目标比例一致"，
+#: 不值得巡视（否则取景框会在几像素内来回抖，比静止更难看）。
+SCAN_MIN_SPAN_PX = 8.0
+
+#: 空镜巡视的默认单程时长（秒）：从画面一端平缓移到另一端用多久。
+#: 12 秒 ≈ 6px/帧（1080p 横屏转竖屏实测），慢到看不出"被裁"，又能在
+#: 一段十几秒的空镜里看完整个画面宽度。
+DEFAULT_SCAN_SECONDS = 12.0
+
+#: 巡视相位的"尚未开始"哨兵值（正常相位在 ``[0, 1)``）
+_SCAN_IDLE = -1.0
+
 
 @dataclass(frozen=True, slots=True)
 class SmoothingParams:
     """镜头运动的稳定性参数（对应 ``AppConfig`` 的 ``smoothing_*`` 字段）。"""
 
-    #: 取景框中心点的 EMA 系数，(0, 1]，越大越跟手
-    alpha: float = 0.25
+    #: 取景框中心点的 EMA 系数，(0, 1]，越大越跟手（默认值即「跟手」档）
+    alpha: float = 0.45
     #: 自由活动区（相对取景框边长）：人物在框内的位移小于它时镜头完全不动
-    deadzone: float = 0.15
+    deadzone: float = 0.06
     #: 缩放（推拉）的 EMA 系数，通常明显小于 ``alpha``，避免呼吸式变焦
-    zoom_alpha: float = 0.08
+    zoom_alpha: float = 0.15
     #: 缩放死区（相对取景框高度）
-    zoom_deadzone: float = 0.10
+    zoom_deadzone: float = 0.05
     #: 平移速度上限（相对框长 / 帧），0 = 不限制
-    max_speed: float = 0.025
+    max_speed: float = 0.05
     #: 加速平滑，(0, 1]：越小起步越柔和，1 = 不限制加速度
     accel: float = 0.5
     #: 丢失目标后保持上一帧取景框的最大帧数（按 :data:`REFERENCE_FPS` 的时长标定）
     hold_frames: int = 30
+    #: 空镜巡视的单程时长（秒）：画面里没有主要人物、且显示方式为 ``scan`` 时，
+    #: 取景框从一端平缓移到另一端所需的时间；``0`` = 关闭巡视（退回画面居中）。
+    scan_seconds: float = DEFAULT_SCAN_SECONDS
+    #: 画面里没有主要人物（且超出保持帧数）时怎么显示，取值见 :data:`NO_PERSON_MODES`：
+    #: ``fit`` = 整幅画面等比缩小完整放入（默认）；``tiles`` = 全景 + 特写；
+    #: ``scan`` = 空镜巡视；``center`` = 画面居中裁剪
+    no_person_mode: str = DEFAULT_NO_PERSON_MODE
+    #: 从"人物取景框"过渡到无人物显示的时长（秒）：越大越舒缓，0 = 立即切换
+    no_person_seconds: float = DEFAULT_NO_PERSON_SECONDS
     #: 源视频帧率；给出时把上面这些"每帧"参数换算成与帧率无关的等效值
     #: （``None`` = 不换算，即把源视频当作 :data:`REFERENCE_FPS`）
     fps: float | None = None
@@ -88,12 +170,29 @@ class SmoothingParams:
             raise ValueError(f"accel 必须在 (0, 1] 区间内，当前为 {self.accel}")
         if int(self.hold_frames) < 0:
             raise ValueError(f"hold_frames 不能为负，当前为 {self.hold_frames}")
+        if float(self.scan_seconds) < 0.0:
+            raise ValueError(f"scan_seconds 不能为负（0 = 关闭空镜巡视），当前为 {self.scan_seconds}")
+        mode = str(self.no_person_mode).strip().lower()
+        if mode not in NO_PERSON_MODES:
+            raise ValueError(
+                f"no_person_mode 只能是 {' / '.join(NO_PERSON_MODES)}，当前为 {self.no_person_mode!r}"
+            )
+        if float(self.no_person_seconds) < 0.0:
+            raise ValueError(
+                f"no_person_seconds 不能为负（0 = 立即切换），当前为 {self.no_person_seconds}"
+            )
         if self.fps is not None and float(self.fps) <= 0.0:
             raise ValueError(f"fps 必须为正（帧率未知时用 None），当前为 {self.fps}")
 
 
-#: 默认平滑参数（与 :class:`~video2personvideo.config.AppConfig` 的默认值一致）
-DEFAULT_SMOOTHING_PARAMS = SmoothingParams()
+#: 默认平滑参数（= "跟手"档，与 :class:`~video2personvideo.config.AppConfig` 的默认值一致）
+DEFAULT_SMOOTHING_PARAMS = SmoothingParams(
+    alpha=0.45,
+    deadzone=0.06,
+    zoom_alpha=0.15,
+    zoom_deadzone=0.05,
+    max_speed=0.05,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,7 +236,7 @@ CAMERA_PRESETS: dict[str, CameraPreset] = {
         _preset(
             "standard",
             "标准",
-            "默认：镜头较少移动，人物基本居中",
+            "镜头较少移动，人物基本居中",
             alpha=0.25,
             deadzone=0.15,
             zoom_alpha=0.08,
@@ -147,7 +246,7 @@ CAMERA_PRESETS: dict[str, CameraPreset] = {
         _preset(
             "active",
             "跟手",
-            "镜头跟得紧、画面运动感强，适合素材本身运动幅度小的情况",
+            "默认：镜头跟得紧、画面运动感强，适合素材本身运动幅度小的情况",
             alpha=0.45,
             deadzone=0.06,
             zoom_alpha=0.15,
@@ -158,7 +257,7 @@ CAMERA_PRESETS: dict[str, CameraPreset] = {
 }
 
 #: 默认档位
-DEFAULT_CAMERA_PRESET = "standard"
+DEFAULT_CAMERA_PRESET = "active"
 
 
 def camera_preset(key: str | None) -> CameraPreset:
@@ -234,6 +333,18 @@ def _soft_zone(offset: float, zone: float) -> float:
     return 0.0
 
 
+def _phase_for_offset(offset: float, span: float) -> float:
+    """把"沿巡视轴偏了多少像素"换算成行程相位（取上升段，即向右 / 向下的那半程）。
+
+    位移函数为 ``h(φ) = (1 - cos 2πφ) / 2 × span``，反解即得；“偏移超出行程”时
+    夹到两端，于是取景框不会因为上一帧在画面外而算出一个奇怪的相位。
+    """
+    if span <= 0.0:
+        return 0.0
+    position = min(max(float(offset) / span, 0.0), 1.0)
+    return math.acos(1.0 - 2.0 * position) / (2.0 * math.pi)
+
+
 def _speed_limit(offset: float, size: float, max_speed: float) -> float:
     """本帧允许的最大步长：基准速度上限 × 越界放大倍数（平滑饱和，不甩镜）。
 
@@ -263,6 +374,9 @@ class BoxSmoother:
         max_speed: float | None = None,
         accel: float | None = None,
         hold_frames: int | None = None,
+        scan_seconds: float | None = None,
+        no_person_mode: str | None = None,
+        no_person_seconds: float | None = None,
         fps: float | None = None,
     ) -> None:
         """
@@ -275,6 +389,9 @@ class BoxSmoother:
         :param max_speed: 平移速度上限（相对框长 / 帧），0 = 不限制
         :param accel: 加速平滑 (0, 1]，越小起步越柔和
         :param hold_frames: 丢失目标后保持上一帧取景框的最大帧数
+        :param scan_seconds: 空镜巡视的单程时长（秒）；``0`` = 关闭巡视
+        :param no_person_mode: 没有主要人物时的显示方式（见 :data:`NO_PERSON_MODES`）
+        :param no_person_seconds: 拉远过渡的时长（秒）；``0`` = 立即切换
         :param fps: 源视频帧率（换算"每秒感受"用）；不知道时留空，先用 :meth:`set_fps`
                     补上 —— 越早告知，镜头速度越准
         """
@@ -287,6 +404,9 @@ class BoxSmoother:
             "max_speed": max_speed,
             "accel": accel,
             "hold_frames": hold_frames,
+            "scan_seconds": scan_seconds,
+            "no_person_mode": no_person_mode,
+            "no_person_seconds": no_person_seconds,
             "fps": fps,
         }
         given = {key: value for key, value in overrides.items() if value is not None}
@@ -300,9 +420,16 @@ class BoxSmoother:
         self._vx = 0.0
         self._vy = 0.0
         self._vh = 0.0
+        #: 空镜巡视的行程进度（0~1 一个来回）；``-1`` = 尚未开始巡视
+        self._scan_phase = _SCAN_IDLE
+        #: 无人物过渡：进度 0~1、起点（人物还在时的取景框）与最近一帧的几何
+        self._fit_progress = 0.0
+        self._fit_from: CropBox | None = None
+        self._fit_transition: TransitionFrame | None = None
         self.frames = 0
         self.holds = 0
         self.centers = 0
+        self.scans = 0
         #: 换算到当前帧率后的等效参数（``_apply_fps`` 维护）
         self._apply_fps()
 
@@ -334,6 +461,31 @@ class BoxSmoother:
     @property
     def hold_frames(self) -> int:
         return self.params.hold_frames
+
+    @property
+    def scan_seconds(self) -> float:
+        """空镜巡视的单程时长（秒）；``0`` 表示关闭巡视。"""
+        return self.params.scan_seconds
+
+    @property
+    def no_person_mode(self) -> str:
+        """没有主要人物时的显示方式（见 :data:`NO_PERSON_MODES`）。"""
+        return self.params.no_person_mode
+
+    @property
+    def no_person_seconds(self) -> float:
+        """从"人物取景框"拉远到无人物显示的时长（秒）；``0`` = 立即切换。"""
+        return self.params.no_person_seconds
+
+    @property
+    def fit_progress(self) -> float:
+        """无人物过渡的进度：0 = 仍按人物取景框取景，1 = 已完全切到无人物显示。"""
+        return self._fit_progress
+
+    @property
+    def transition(self) -> TransitionFrame | None:
+        """最近一帧无人物过渡的几何（仅 ``fit`` / ``tiles`` 兜底帧有值）。"""
+        return self._fit_transition
 
     # ------------------------------------------------- 只读属性（帧率换算后）
     @property
@@ -384,6 +536,20 @@ class BoxSmoother:
         else:
             # 保持时长按秒恒定：帧率翻倍，允许保持的帧数也翻倍
             self._hold = max(1, int(round(self.params.hold_frames / scale)))
+        # 巡视同理按秒标定：每帧推进的相位 = 1 / (单程秒数 × 帧率 × 2)，帧率无关
+        scan_seconds = float(self.params.scan_seconds)
+        self._scan_step = (
+            0.0
+            if scan_seconds <= 0.0
+            else scale / (2.0 * scan_seconds * REFERENCE_FPS)
+        )
+        # 无人物拉远过渡同样按秒标定：每帧推进"整段过渡的几分之一"
+        no_person_seconds = float(self.params.no_person_seconds)
+        self._fit_step = (
+            0.0
+            if no_person_seconds <= 0.0
+            else scale / (no_person_seconds * REFERENCE_FPS)
+        )
 
     @property
     def box(self) -> CropBox | None:
@@ -403,15 +569,29 @@ class BoxSmoother:
         self._vx = 0.0
         self._vy = 0.0
         self._vh = 0.0
+        self._scan_phase = _SCAN_IDLE
+        self._fit_progress = 0.0
+        self._fit_from = None
+        self._fit_transition = None
         self.frames = 0
         self.holds = 0
         self.centers = 0
+        self.scans = 0
 
     # ----------------------------------------------------------------- 更新
     def update(
-        self, target: CropBox | None, frame_size: tuple[float, float]
+        self,
+        target: CropBox | None,
+        frame_size: tuple[float, float],
+        *,
+        fallback_dst: tuple[int, int, int, int] | None = None,
     ) -> CropBox:
-        """喂入本帧的目标取景框（``None`` 表示本帧没找到人），返回平滑后的取景框。"""
+        """喂入本帧的目标取景框（``None`` 表示本帧没找到人），返回平滑后的取景框。
+
+        ``fallback_dst`` 只在"没有主要人物 + 显示方式为全景 + 特写"时用得上：
+        由调用方给出全景窗口在画布上的格子，于是画面会**直接收进那一格**
+        （而不是先拉远到画布正中再跳上去）。
+        """
         frame_w, frame_h = float(frame_size[0]), float(frame_size[1])
         self.frames += 1
 
@@ -427,12 +607,28 @@ class BoxSmoother:
                 # 保持期间速度归零：重新跟随时从静止柔和起步，不会"弹"一下
                 self._vx = self._vy = self._vh = 0.0
                 return self._box
-            target = center_box((frame_w, frame_h), self.ratio)
-            self.centers += 1
-            mode = MODE_CENTER
+
+            fallback = self.params.no_person_mode
+            if fallback in (MODE_FIT, MODE_TILES):
+                return self._fit_output(frame_w, frame_h, fallback, fallback_dst)
+
+            scan = self._scan_target(frame_w, frame_h) if fallback == MODE_SCAN else None
+            if scan is not None:
+                target = scan
+                self.scans += 1
+                mode = MODE_SCAN
+            else:
+                target = center_box((frame_w, frame_h), self.ratio)
+                self.centers += 1
+                mode = MODE_CENTER
         else:
             self._missing = 0
             self._ever_had_target = True
+            # 人物回来了：巡视行程与拉远过渡一并作废，从"整幅画面"平滑缩回人物身上
+            self._scan_phase = _SCAN_IDLE
+            self._fit_progress = 0.0
+            self._fit_from = None
+            self._fit_transition = None
             mode = target.mode
 
         fitted = target.fit_to(frame_w, frame_h)
@@ -443,9 +639,10 @@ class BoxSmoother:
             return self._box
 
         current = self._box
-        if mode == MODE_CENTER:
-            # 兜底回中：目标是画面正中（不会抖），此时不能设死区，否则会停在
-            # 离中心"一个死区"的位置上；速度限幅与加速平滑仍然生效，回中依旧平缓。
+        if mode in (MODE_CENTER, MODE_SCAN):
+            # 兜底回中 / 空镜巡视：目标要么是画面正中、要么一直在缓慢移动，此时不能设
+            # 死区 —— 否则取景框会停在离目标"一个死区"的位置上，等于把巡视卡死。
+            # 速度限幅与加速平滑仍然生效，回中与巡视的起步依旧平缓。
             zone = zoom_zone = 0.0
         else:
             # 自由活动区按"框长边"取，横竖两个方向感受一致
@@ -475,6 +672,102 @@ class BoxSmoother:
         return self._box
 
     # ------------------------------------------------------------- 内部逻辑
+    def fit_transition(
+        self,
+        frame_size: tuple[float, float],
+        dst_to: tuple[int, int, int, int] | None = None,
+    ) -> TransitionFrame:
+        """无人物兜底的几何：从"人物还在时的取景框"过渡到"整幅画面"。
+
+        :param dst_to: 画布上的终点矩形；默认是"整幅画面等比放入画布"的位置
+                       （``tiles`` 模式下由调用方传入全景格子，画面直接收进上格）
+        """
+        frame_w, frame_h = float(frame_size[0]), float(frame_size[1])
+        out_w, out_h = self.ratio.target_size
+        start = (
+            self._fit_from
+            if self._fit_from is not None
+            else center_box((frame_w, frame_h), self.ratio)
+        )
+        target = dst_to if dst_to is not None else fit_rect((frame_w, frame_h), (out_w, out_h))
+        return transition_frame(
+            (start.x, start.y, start.w, start.h),
+            (0.0, 0.0, frame_w, frame_h),
+            (0.0, 0.0, float(out_w), float(out_h)),
+            (float(target[0]), float(target[1]), float(target[2]), float(target[3])),
+            self._fit_progress,
+        )
+
+    def _fit_output(
+        self,
+        frame_w: float,
+        frame_h: float,
+        mode: str,
+        dst_to: tuple[int, int, int, int] | None,
+    ) -> CropBox:
+        """无人物兜底帧：推进过渡进度，返回"正在取出的那一块画面"。
+
+        返回的框比例会从目标比例一路过渡到源比例（:data:`MODE_FIT` 的说明里有交代），
+        真正贴到画布上的合成由裁剪层按 :attr:`transition` 完成。
+        """
+        if self._box is None:
+            # 视频一开始就没人：没有"从哪来"，直接落在最终状态，不做无谓的拉远
+            self._fit_from = None
+            self._fit_progress = 1.0
+        else:
+            if self._fit_from is None:
+                self._fit_from = self._box
+            self._fit_progress = (
+                min(self._fit_progress + self._fit_step, 1.0)
+                if self._fit_step > 0.0
+                else 1.0
+            )
+
+        transition = self.fit_transition((frame_w, frame_h), dst_to)
+        self._fit_transition = transition
+        x, y, width, height = transition.src
+        # 重新跟人时从静止柔和起步，不会"弹"一下
+        self._vx = self._vy = self._vh = 0.0
+        self._box = CropBox(x, y, width, height, mode=mode)
+        return self._box
+
+    def _scan_target(self, frame_w: float, frame_h: float) -> CropBox | None:
+        """空镜巡视的目标取景框：沿"画面多出来的那一侧"缓慢往返。
+
+        以"画面正中的最大等比取景框"为基准 —— 它的宽或高中必然有一边已经等于画面
+        尺寸，另一边还差 ``span`` 像素，这段多出来的画面正是居中裁剪时被丢掉的内容
+        （横屏素材转竖屏时就是左右两边各一大块）。让取景框在这段区间里按正弦缓动
+        往返（一端正好贴住画面左 / 上边，另一端正好贴住右 / 下边），就能用几个来回
+        把整幅画面看完。
+
+        :returns: 本帧的巡视目标框；没有可巡视的空间（源比例已与目标一致）、
+                  或巡视被关闭（``scan_seconds == 0``）时返回 ``None``，由调用方退回回中。
+        """
+        if self._scan_step <= 0.0:
+            return None
+
+        base = center_box((frame_w, frame_h), self.ratio)
+        span_x = max(frame_w - base.w, 0.0)
+        span_y = max(frame_h - base.h, 0.0)
+        horizontal = span_x >= span_y
+        span = span_x if horizontal else span_y
+        if span < SCAN_MIN_SPAN_PX:
+            return None
+
+        if self._scan_phase < 0.0:
+            # 首次巡视：从"当前取景框所在的位置"起步，免得先倒着跑到一端再出发
+            current = 0.0 if self._box is None else (self._box.x if horizontal else self._box.y)
+            self._scan_phase = _phase_for_offset(current, span)
+        self._scan_phase = (self._scan_phase + self._scan_step) % 1.0
+
+        # 正弦缓动：两端速度为 0、中间最快，于是折返是"减速 → 停 → 反向"，
+        # 不会像匀速往返那样在端点出现一次生硬的急停急起。
+        # 偏移量本身就是画面上合法的最左 / 最上位置（0 ~ span），因此全程不越界。
+        offset = (0.5 - 0.5 * math.cos(2.0 * math.pi * self._scan_phase)) * span
+        if horizontal:
+            return replace(base, x=offset, mode=MODE_SCAN)
+        return replace(base, y=offset, mode=MODE_SCAN)
+
     def _advance(
         self,
         current: float,

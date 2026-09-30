@@ -1,10 +1,6 @@
 -r requirements.txt
 -r requirements-gui.txt
 
-# 测试
-pytest==9.1.1
-pytest-cov>=6.0
-
 # 代码风格 / 静态检查
 ruff==0.16.9
 

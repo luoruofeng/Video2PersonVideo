@@ -9,7 +9,7 @@
 - **人像构图裁剪**：输出比例完全由用户决定（`9:16` / `16:9` / `1:1` / `4:5` / `21:9`…），
   裁剪框自动跟随画面中的主要人物，输出每一帧的宽高比恒等于所选比例
 - **主角选择**：多人物场景下按「面积 + 靠近中心 + 时序连续（IoU）+ 置信度」打分，
-  主角不会每帧乱跳；人物过小（默认 < 画面高 8%）视为无人物
+  主角不会每帧乱跳；人物过小（bbox 高不足画面高的 `min_person_height_ratio`，默认 `0.73`）视为无人物
 - **说话人跟随（多人物时对准正在说话的人）**：YOLO 本身判断不了"谁在说话"（纯图像模型，
   关键点里也没有嘴部），所以补上音频这一半 —— 抽音轨算**逐帧语音能量包络**，
   再看每个人的**嘴部运动**，谁的声音与嘴型最同步就跟谁（音频-视觉主动说话人检测）；
@@ -34,10 +34,22 @@
   针对"人一走动镜头就跟着摇"的晕动感做了专门处理；
   镜头参数按**每秒感受**标定，并用源视频真实帧率换算，24 / 30 / 60fps 素材的
   镜头真实速度一致（60fps 不会比 30fps 快一倍）；
-  另提供「锁定 / 舒缓 / 标准 / 跟手」四档镜头跟随预设（`--camera-follow`）
+  另提供「锁定 / 舒缓 / 标准 / 跟手」四档镜头跟随预设（`--camera-follow`，默认「跟手」）
 - **两级提速**：`--detect-interval N` 抽帧检测 + 线性插值，`--infer-batch N` 批量帧推理，
   两者结果与逐帧推理逐帧等价（有专门测试兜住）
-- **三级兜底**：短暂丢失目标时保持上一帧取景框 → 超时平滑回中 → 整段无人时按比例居中裁剪
+- **无人物时的显示方式（默认「全画面适配」，让观众看到完整的"主屏幕"）**：短暂丢失目标
+  时保持上一帧取景框；仍然无人（超出 `hold_frames`）时按 `no_person_mode` 显示：
+  - `fit`（默认）**全画面适配**：整幅画面等比缩小**完整放进**输出画布，上下的留白用
+    **同一帧的模糊放大版**填满（不是黑边、不引入画面之外的信息）—— 一帧看全、镜头
+    **完全不移动**，从"人物取景框"到"整幅画面"用 `no_person_seconds` 秒平缓拉远；
+  - `tiles` **全景 + 特写**：整幅画面收进上方通栏，下方纵向排列几个**次要小人物**
+    （高度占比低于 `min_person_height_ratio`、又高于 `no_person_secondary_ratio` 的远景人物）
+    的**上半身特写**，过渡后半段淡入 —— 每格承载不同信息（环境 + 被过滤掉的人），
+    既保住全貌又看得清人；没有够大的小人物、或竖屏里排不下时自动退回全画面适配；
+    纵向排列的是**不同内容**而不是同一画面的复制（同一时刻只有一幅画面）；
+  - `scan` **空镜巡视**：取景框沿"源画面比取景框多出来的那一侧"缓慢往返，几个来回把被
+    居中裁剪丢掉的左右 / 上下内容带到成片里（单程时长 `smoothing_scan_seconds`）；
+  - `center` **画面居中**：直接取画面正中，最保守的一档
 - **分辨率恒定**：输出尺寸只初始化一次（且宽高均为偶数），全程不出现丢帧、黑边或变形
 - **体积守护**：OpenCV 只能写 `mp4v`，成品体积常是原视频的 3~10 倍；
   一旦「输出体积 > 原视频 × `max_size_ratio`」就自动按体积上限反推码率重压成 H.264
@@ -53,6 +65,10 @@
   再带**断点续传**地把 wheel 与 YOLO 权重下下来（暂停 / 断网 / 关机都不白下）；
   **已有的内容不会重复下载**（本机装过 PyTorch / 已有权重时页面会写明并默认跳过），
   已经自检过、或本机环境本来就齐全时，这一步直接跳过
+- **可视化安装包（Setup.exe）**：把项目当成普通 Windows 软件安装 —— 图形向导里选目录、
+  按显卡挑 PyTorch、边装边下载（断点续传）；安装进度逐步落盘，任何一步中断都能
+  「继续安装 / 暂停并退出 / 回滚并退出」，已经下好的部分绝不白下；
+  装完自动建快捷方式、登记卸载信息，**全程不需要管理员权限**
 - 音轨保留（ffmpeg 合并）、可选 H.264 重编码、含人帧截图、环境自检 `v2pv --check`
 - 输出体积与「相对原视频的倍数」在结果汇总里如实报出，压不动也会明说
 
@@ -66,6 +82,20 @@
                              ├─► 谁在说话 ─► 主角打分的偏置 ─► （叠加到上面的"选主角"，M7）
 画面中每人的嘴部运动 ────────┘
 ```
+
+画面里**没有主要人物**时，"取景框"这条线换成"无人物显示"（见上一节的 `no_person_mode`）：
+
+```
+无人帧 ──► 保持 hold_frames 帧 ──► 仍无人 ──► 过渡进度 0→1（no_person_seconds 秒，缓入缓出）
+                                            ├─ fit    整幅画面 → 全画面适配矩形（画布仍是 9:16）
+                                            ├─ tiles  整幅画面 → 上方通栏 + 下方特写（淡入）
+                                            ├─ scan   取景框沿多出来的那一侧缓慢往返
+                                            └─ center 取景框回中
+```
+
+过渡的几何由 `core/layout.py:transition_frame` 统一给出：**源侧**从"人物取景框"连续变成
+"整幅画面"，**画布侧**从"整块画布"连续变成"目标矩形"，两边的宽高比在每一帧都相等
+（比例本身也在插值），因此中间任何一帧都**不拉伸、不越界、不出现空洞**。
 
 多人物场景的"选主角"有两条通路：默认按面积 / 居中 / 时序 / 置信度打分；
 开启**说话人跟随**后，会先判定"现在谁在说话"（音频-视觉主动说话人检测），
@@ -107,7 +137,12 @@
 | 3 | 取景框自身比例恒定 | 先平滑中心点，再按比例反推宽高，不分别独立平滑宽高 |
 | 4 | 不出现黑边 / 变形 / 越界 | 先 `clamp`/`fit` 再切片，不做 letterbox、不做非等比缩放 |
 
-模块划分（全部纯函数，可脱离视频单测）：
+> 不变量 3 有一条**明确标注的例外**：没有主要人物且显示方式为 `fit` / `tiles` 时不存在
+> "取景框"，`CropBox` 被借用来表示"从源画面取出的那一块"（比例从目标比例连续过渡到源
+> 比例），真正的合成由 `core/crop.py` 完成。不变量 1 / 2 / 4 在这一档同样成立：
+> 画布仍是 9:16、尺寸仍是偶数且恒定、画面完整放入并居中（留白由模糊底填充，不是黑边）。
+
+模块划分（`core/` 里的几何与打分都是纯函数，可脱离视频单测）：
 
 | 模块 | 职责 |
 |---|---|
@@ -118,17 +153,26 @@
 | `core/audio.py` | 音轨 → 逐帧语音能量包络 + 语音活动判定（说话人跟随的音频侧） |
 | `core/mouth.py` | 嘴部 ROI 定位与嘴动强度测量（说话人跟随的视觉侧） |
 | `core/speaker.py` | 主动说话人判定：轨迹关联 + 相关性 + 切换滞回 |
-| `core/layout.py` | 多人分屏布局表：字符网格解析、按比例 / 人数查表、像素划分 |
+| `core/layout.py` | 分屏布局表与几何：字符网格解析、按比例 / 人数查表、像素划分、全画面适配矩形、无人物过渡几何、全景 + 特写网格 |
 | `core/multi.py` | 多人分屏合成：选人排座、逐人取景、轨迹关联与逐人平滑 |
+| `core/noperson.py` | 无人物帧的显示：全画面适配的外观参数、「全景 + 特写」的选人与排布 |
 | `core/smoothing.py` | 取景框时序平滑、自由活动区、速度 / 加速度限幅、帧率归一化、镜头档位预设、保持 N 帧 |
 | `core/crop.py` | `frame + CropBox → 固定尺寸输出帧` |
 | `core/pipeline.py` | 编排：检测 → 选主角 → 构图 → 平滑 → 裁剪，含抽帧插值 |
 | `core/batch.py` | 扫描路径、任务队列、失败隔离、两级进度 |
+| `core/detector.py` | YOLO 人像检测器：模型加载、推理、画框（结构化 bbox / 关键点） |
+| `core/video_io.py` | 视频底层读写：读帧预读 + 写帧异步（后台线程）、截图 |
+| `core/processor.py` | 单视频处理流水线：检测 → 选主角 → 构图裁剪 → 写视频 → 补回音轨 + 统计结果 |
 | `utils/gpu_probe.py` | 硬件自检：CPU / 显卡型号 → 厂商 · 架构 · 算力（型号库覆盖主流型号） |
 | `utils/torch_backends.py` | PyTorch 构建选择表：算力 + 驱动 + 系统 → 该装那一套（纯函数） |
 | `utils/downloader.py` | 断点续传下载：`Range` 续传 + `sha256` 校验 + 重试 + 可取消 |
 | `utils/torch_install.py` | 解析官方索引 → 挑 wheel → 生成下载计划 → `pip` 安装 |
 | `utils/env_check.py` | 本机环境速查：PyTorch / YOLO 权重是否已在本地（不 `import`、不联网，用于决定要不要弹下载页） |
+| `utils/app_paths.py` | 安装布局与随包资源定位（安装根识别、模型 / 随包 ffmpeg 目录、随包工具挂到 `PATH`） |
+| `utils/device.py` | 推理设备探测（CUDA / MPS / CPU）与环境自检报告（`v2pv --check` 的内容） |
+| `utils/ffmpeg_tools.py` | ffmpeg / ffprobe 调用：音轨探测与合并、H.264 重编码、媒体信息（带结果缓存） |
+| `utils/logger.py` | 统一日志配置（命令行与 GUI 共用，GUI 可把日志转发到界面） |
+| `gui/framing_sketch.py` | 自绘示意图：比例页右侧按当前档位画出「无人时 / 多人分屏」输出长什么样 |
 
 ## 目录结构
 
@@ -138,7 +182,8 @@ Video2PersonVideo/
 ├── requirements*.txt           # 运行期 / GUI / 开发依赖
 ├── configs/default.yaml        # 全部可调参数（含裁剪构图参数与注释）
 ├── configs/multi_person_layout.yaml  # 多人分屏布局表（按比例 + 人数查表）
-├── build/Video2PersonVideo.spec# PyInstaller 打包配置
+├── build/Video2PersonVideo.spec        # 主程序 PyInstaller 打包配置
+├── build/Video2PersonVideo-Setup.spec  # 安装器（Setup.exe）打包配置
 ├── data/input|output/          # 素材与（可选）统一输出目录
 ├── assets/models|samples/      # 权重与演示素材（默认不提交）
 ├── scripts/                    # 一键建环境 / 打包 / 打包入口
@@ -153,8 +198,9 @@ Video2PersonVideo/
 │   │   ├── audio.py            # 音轨 → 语音能量包络与语音活动
 │   │   ├── mouth.py            # 嘴部 ROI 与嘴动强度
 │   │   ├── speaker.py          # 主动说话人判定（轨迹 + 相关性 + 滞回）
-│   │   ├── layout.py           # 多人分屏布局表（网格解析 / 查表 / 像素划分）
+│   │   ├── layout.py           # 分屏布局与几何（网格解析 / 查表 / 像素划分 / 过渡几何）
 │   │   ├── multi.py            # 多人分屏合成（选人排座 / 逐人取景 / 平滑）
+│   │   ├── noperson.py         # 没有主要人物时的显示（全画面适配 / 全景 + 特写）
 │   │   ├── smoothing.py        # 时序平滑
 │   │   ├── crop.py             # 切片 + 缩放
 │   │   ├── pipeline.py         # 单视频裁剪流水线
@@ -172,14 +218,37 @@ Video2PersonVideo/
 │   │   ├── ratio_grid.py       # 比例网格卡片
 │   │   ├── ratio_dialog.py     # 比例选择对话框
 │   │   ├── preview_dialog.py   # 处理前构图预览
+│   │   ├── framing_sketch.py   # 构图参数自绘示意图（比例页右侧"无人时输出长什么样"）
 │   │   └── pages/              # 输入 / 比例 / 执行 / 结果 / 环境自检页
-│   └── utils/                  # 日志、设备探测、环境速查、显卡自检、PyTorch 构建表、断点续传下载、ffmpeg 调用
-└── tests/                      # pytest：单元 + 不变量 + 端到端 + GUI 冒烟
+│   ├── installer/              # 可视化安装器（打包成 Setup.exe，与主程序分开）
+│   │   ├── app.py              # 安装器入口（GUI / 命令行分发、日志落盘）
+│   │   ├── cli.py              # 参数解析：--silent / --uninstall / --list-backends…
+│   │   ├── stages.py           # 安装阶段模型（权重 / 可否续传 / 中断说明）
+│   │   ├── journal.py          # 安装状态日志 install.json（原子写 + 镜像 + 续装判定）
+│   │   ├── engine.py           # 安装引擎：部署运行时 → pip → PyTorch → 依赖 → 本体 → YOLO → ffmpeg → 收尾
+│   │   ├── runtime.py          # 内嵌 Python（embeddable）下载 / 解压 / 修 ._pth
+│   │   ├── payload.py          # 随安装器分发的程序本体与依赖清单
+│   │   ├── options.py          # 组件选择（PyTorch 构建 / 权重 / ffmpeg / 快捷方式）
+│   │   ├── windows.py          # 快捷方式、卸载注册表、目录自删、启动入口
+│   │   ├── paths.py            # 安装目录布局与系统位置
+│   │   └── gui/                # 安装向导（欢迎 / 位置 / 组件 / 进度 / 完成 + 卸载对话框）
+│   └── utils/
+│       ├── logger.py           # 统一日志配置
+│       ├── device.py           # 推理设备探测（CUDA / MPS / CPU）与环境自检报告
+│       ├── app_paths.py        # 安装布局 / 资源定位（安装根、模型目录、随包 ffmpeg）
+│       ├── env_check.py        # 本机环境速查（PyTorch / 权重是否已在本地，不联网）
+│       ├── gpu_probe.py        # 硬件自检：CPU / 显卡型号 → 厂商 · 架构 · 算力
+│       ├── torch_backends.py   # PyTorch 构建选择表（算力 + 驱动 + 系统）
+│       ├── torch_install.py    # 官方索引解析 / wheel 挑选 / 下载计划 / pip 安装
+│       ├── downloader.py       # 断点续传下载（Range + sha256 + 重试 + 可取消）
+│       └── ffmpeg_tools.py     # ffmpeg / ffprobe 调用（音轨、转码、媒体信息、体积）
+└── tests/                      # pytest：单元 + 不变量 + 端到端 + GUI 冒烟 + 安装器
 ```
 
 ## 环境要求
 
 - Python 3.11 ~ 3.13（本机实测 3.13）
+- **用安装包（Setup.exe，仅 Windows）安装时不需要上面这些**：安装器自带一份独立的 Python 运行时
 - Windows / Linux / macOS 均可；打包 exe 面向 Windows
 - 可选：NVIDIA 显卡 + 驱动（开启 CUDA 推理，速度提升明显）
 - 可选：`ffmpeg` 并加入 PATH（用于保留音轨、可变帧率时间轴归一化、H.264 重编码、
@@ -187,6 +256,21 @@ Video2PersonVideo/
   下载地址 <https://www.gyan.dev/ffmpeg/builds/> 或 `winget install Gyan.FFmpeg`
 
 ## 快速开始
+
+三种装法，按需要挑一种（装完都是同一个东西：可用的 `v2pv` 命令 + 可选图形界面）：
+
+| 方式 | 适合谁 | 需要预装什么 | 见 |
+|---|---|---|---|
+| **安装包 `Video2PersonVideo-Setup.exe`** | 最终用户（Windows），只想用 | 什么都不用（自带 Python、免管理员权限） | 第 0 步 /「安装成 Windows 软件」 |
+| **一键脚本 `scripts\setup_env.ps1`** | 开发者（Windows） | Python 3.11~3.13 | 第 1 步 |
+| **手动 pip 安装** | 开发者（Windows / Linux / macOS） | Python 3.11~3.13 | 第 2 步 |
+
+### 0. 像装软件一样装（最终用户，推荐）
+
+下载 `Video2PersonVideo-Setup.exe` 双击，按向导走完即可
+（不需要预装 Python、不需要管理员权限）。细节见「安装成 Windows 软件」一节。
+
+下面 1~5 是开发者 / 高级用户从源码跑的用法。
 
 ### 1. 一键安装（推荐）
 
@@ -198,7 +282,19 @@ powershell -ExecutionPolicy Bypass -File scripts\setup_env.ps1
 powershell -ExecutionPolicy Bypass -File scripts\setup_env.ps1 -Backend cuda
 ```
 
+脚本会把「建虚拟环境 → 装 PyTorch → 装其余依赖 → `pip install -e .` → 跑一次 `--check`」
+一条龙做完。可用参数：
+
+| 参数 | 作用 | 默认值 |
+|---|---|---|
+| `-Backend cpu\|cuda` | 装 CPU 版还是 CUDA 版 PyTorch | `cpu` |
+| `-TorchIndexUrl <url>` | CUDA 版 torch 的索引地址（要换 CUDA 版本时改它） | `https://download.pytorch.org/whl/cu129` |
+| `-VenvDir <dir>` | 虚拟环境目录（已存在则直接复用） | `.venv` |
+| `-Dev` | 额外装开发 / 打包依赖（ruff、pyinstaller、auto-py-to-exe） | 关 |
+
 ### 2. 手动安装
+
+Windows（PowerShell）：
 
 ```powershell
 python -m venv .venv
@@ -213,6 +309,24 @@ pip install -r requirements.txt
 pip install -r requirements-gui.txt   # 需要图形界面时
 pip install -e .
 ```
+
+Linux / macOS（bash / zsh）：
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+
+# Apple 芯片装 CPU 版即可（自带 Metal / MPS 加速）；NVIDIA 卡换官方 CUDA 索引地址
+pip install torch torchvision
+
+pip install -r requirements.txt
+pip install -r requirements-gui.txt   # 需要图形界面时
+pip install -e .
+```
+
+> `scripts\*.ps1`（一键安装 / 打包）是 Windows 专用；Linux / macOS 走上面的手动步骤，
+> 或改用 `pip install -e ".[gui]"`（等价于 `requirements-gui.txt`）。
+> **先装 PyTorch 再装其余依赖**：`ultralytics` 也会拉 torch，顺序反了会装成 CPU 版。
 
 ### 3. 跑一次
 
@@ -240,6 +354,37 @@ v2pv --gui
 v2pv -i demo.mp4 -m yolo11n-pose.pt    # 6MB，自动下载
 ```
 
+### 4. 验证安装
+
+```powershell
+v2pv --version      # 版本号
+v2pv --check        # 环境自检：设备 / torch / CUDA 是否可用 / ffmpeg / 默认权重
+```
+
+`--check` 是判断"装对没有"的权威口径，重点看两行：
+
+- `CUDA 可用: 是` —— 才说明装的是 GPU 版 torch；显示 `否` 说明装成了 CPU 版，
+  按第 1 / 2 步换 CUDA 索引地址重装（也可以打开界面点左下角「环境自检」让它自动判断）；
+- `ffmpeg` —— 显示路径即已就绪；显示「未找到…」说明 PATH 里没有 ffmpeg，
+  音轨保留 / 时间轴归一化 / 体积守护 / 说话人跟随都会退化成"跳过"，出片功能不受影响。
+
+图形界面：`v2pv --gui`（首次打开可能先进「环境自检」，见后面一节）。
+
+### 5. 升级 / 卸载
+
+源码安装（`pip install -e .`）：
+
+```powershell
+git pull
+pip install -r requirements.txt   # 依赖有变动时
+pip install -e .                  # 重新登记入口点（升级后必做）
+
+pip uninstall video2personvideo   # 卸载；接着删掉 .venv 或整个项目目录即可
+```
+
+用安装包装的（Windows）见「卸载」一节：开始菜单 / 设置 → 应用 / 安装目录里的
+`Uninstall.cmd` 三个入口等效，卸载器还会顺带清掉快捷方式与注册表项。
+
 ## 命令行参数
 
 | 参数 | 说明 | 默认值 |
@@ -259,17 +404,23 @@ v2pv -i demo.mp4 -m yolo11n-pose.pt    # 6MB，自动下载
 | `--detect-interval` | 每 N 帧推理一次，中间帧线性插值 | `1` |
 | `--infer-batch` | 一次推理塞几帧（批量帧推理提速） | `1` |
 | `--no-keypoints` | 即使模型自带姿态关键点也不用于精修构图 | 关（自动启用） |
-| `--camera-follow` | 镜头跟随档位：`lock` / `calm` / `standard` / `active`（一次设置一组平滑参数） | `standard` |
-| `--deadzone` | 自由活动区（相对框长）：人物在框内走动小于它时镜头**完全不动** | `0.15` |
-| `--smoothing-alpha` | 平移平滑系数（越大越跟手） | `0.25` |
-| `--pan-speed` | 平移速度上限（相对框长/帧，防甩镜；`0` = 不限） | `0.025` |
-| `--zoom-alpha` | 缩放（推拉）平滑系数，越小越不易晕 | `0.08` |
-| `--zoom-deadzone` | 缩放死区（相对框高） | `0.10` |
+| `--camera-follow` | 镜头跟随档位：`lock` / `calm` / `standard` / `active`（一次设置一组平滑参数） | `active` |
+| `--deadzone` | 自由活动区（相对框长）：人物在框内走动小于它时镜头**完全不动** | `0.06` |
+| `--smoothing-alpha` | 平移平滑系数（越大越跟手） | `0.45` |
+| `--pan-speed` | 平移速度上限（相对框长/帧，防甩镜；`0` = 不限） | `0.05` |
+| `--zoom-alpha` | 缩放（推拉）平滑系数，越小越不易晕 | `0.15` |
+| `--zoom-deadzone` | 缩放死区（相对框高） | `0.05` |
 | `--hold-frames` | 丢失目标后保持取景框的帧数 | `30` |
-| `--min-person-ratio` | 人物过小阈值（bbox 高 / 画面高） | `0.08` |
+| `--no-person-mode` | 没有主要人物时怎么显示：`fit`（全画面适配）/ `tiles`（全景 + 特写）/ `scan`（空镜巡视）/ `center`（画面居中） | `fit` |
+| `--no-person-seconds` | 从"人物取景框"过渡到无人物显示的时长（秒）；`0` = 立即切换 | `0.8` |
+| `--[no-]blur-background` | 无人物画面的留白用"同一帧的模糊放大版"填充（关闭 = 用纯色底色） | 开 |
+| `--no-person-tiles-max` | 「全景 + 特写」最多给几个远景小人物开特写窗口（1~4） | `2` |
+| `--no-person-secondary-ratio` | 「全景 + 特写」里小人物的高度下限（占画面比例），低于它不给特写 | `0.12` |
+| `--scan-seconds` | 「空镜巡视」的单程时长（秒），只在 `--no-person-mode scan` 时用得上；`0` = 关闭、退回居中 | `12.0` |
+| `--min-person-ratio` | 人物过小阈值（bbox 高 / 画面高）：低于它的人算背景路人 | `0.73` |
 | `--headroom` | 半身构图的头顶留白比例 | `0.08` |
 | `--[no-]speaker-tracking` | 多人物时优先对准**正在说话的人**（需要 ffmpeg 抽音轨） | 启用 |
-| `--speaker-weight` | 说话人偏置大小（与主角打分同量纲，0~1；≥1.0 时说话人必定胜出） | `1.8` |
+| `--speaker-weight` | 说话人偏置大小（与归一化后的主角打分同量纲，≥0；≥1.0 时"正在说话的人"必定胜出，<1.0 则是"软优先"） | `1.8` |
 | `--speaker-switch-margin` | 换人所需的最低领先分差 | `0.15` |
 | `--speaker-switch-hold` | 换人前挑战者需连续领先的判定回合数（越大镜头越稳） | `8` |
 | `--speaker-window` | 语音-嘴动的相关性滑窗长度（帧），约 1~1.5 秒 | `45` |
@@ -301,7 +452,14 @@ v2pv -i demo.mp4 -m yolo11n-pose.pt    # 6MB，自动下载
 - 人物一走动镜头就跟着摇、看着头晕 → `--camera-follow lock`；只想稍稳一点用 `calm`，
   想更跟手用 `active`。也可以逐项调：**调大 `--deadzone`**（人物更自由地在画面内走动、
   镜头不动）、**调小 `--pan-speed`**（镜头移动更慢）、调小 `--smoothing-alpha`
-- 人物太小也被当成主角 → 调高 `--min-person-ratio`
+- 背景里的路人 / 小人也被当成主角 → 调高 `--min-person-ratio`（默认 `0.73`，只认画面里占比够大的人）
+- 没有人物时空镜"看着空"或"切得太狠" → 用 `--no-person-mode` 换档：
+  想看到完整画面（推荐）保持默认 `fit`；想让远景小人物也看得清用 `tiles`
+  （配 `--no-person-tiles-max` / `--no-person-secondary-ratio` 调数量与门槛）；
+  喜欢"镜头慢慢扫过去"的观感用 `scan`（再配 `--scan-seconds` 调快慢）；
+  只想稳稳取画面中就 `center`。过渡生硬 / 突兀 → 调大 `--no-person-seconds`
+- 全画面适配时觉得上下留白太抢眼 → `--no-blur-background` 换成纯色底，或
+  `--no-person-mode tiles` 把纵向空间用起来
 - 人物头顶总是被切 → 调大 `--headroom`
 - 多人对话时镜头跟错了人 / 切换太频繁 → 调大 `--speaker-switch-hold`（换人更慎重）、
   调大 `--speaker-switch-margin`；判定太"强势"（偶尔被噪声带偏）→ 调小
@@ -328,13 +486,19 @@ target_width: null          # 自定义目标像素（两者同时给出才生�
 target_height: null
 crop: true                  # 关闭则回到旧的逐帧画框标注模式
 overwrite: false            # 同名输出存在时跳过
-smoothing_deadzone: 0.15    # 自由活动区：人物在框内走动小于它时镜头完全不动
-smoothing_alpha: 0.25       # 镜头跟进快慢
-smoothing_max_speed: 0.025  # 平移速度上限（相对框长/帧），防止甩镜
+smoothing_deadzone: 0.06    # 自由活动区：人物在框内走动小于它时镜头完全不动
+smoothing_alpha: 0.45       # 镜头跟进快慢
+smoothing_max_speed: 0.05   # 平移速度上限（相对框长/帧），防止甩镜
 smoothing_accel: 0.5        # 起步/反向的柔和度（越小越柔和）
-smoothing_zoom_alpha: 0.08  # 缩放（推拉）比平移更慢
-smoothing_zoom_deadzone: 0.10
+smoothing_zoom_alpha: 0.15  # 缩放（推拉）比平移更慢
+smoothing_zoom_deadzone: 0.05
 hold_frames: 30             # 短暂丢人时保持取景框的帧数
+no_person_mode: fit         # 没有主要人物时怎么显示：fit / tiles / scan / center
+no_person_seconds: 0.8      # 从人物取景框过渡到无人物显示的时长（秒），0 = 立即切换
+no_person_blur: true        # 无人物画面的留白用同一帧的模糊放大版填充
+no_person_tiles_max: 2      # 「全景 + 特写」最多给几个远景小人物开特写窗口（1~4）
+no_person_secondary_ratio: 0.12  # 「全景 + 特写」里小人物的高度下限（占画面比例）
+smoothing_scan_seconds: 12.0  # 「空镜巡视」单程时长（秒），只在前一项为 scan 时用得上
 detect_interval: 1          # 每 N 帧推理一次
 infer_batch: 1              # 一次推理塞几帧（批量帧推理提速）
 speaker_tracking: true      # 多人物时优先对准正在说话的人（需 ffmpeg 抽音轨）
@@ -401,8 +565,10 @@ v2pv --gui
    可微调**镜头跟随档位**（锁定 / 舒缓 / 标准 / 跟手）、人物最小占比、头顶留白，
    可勾选「多人分屏 · 每人一个上半身窗口」（**默认勾选**；取消勾选 = 整段视频同时只显示一个人）
    与「优先对准正在说话的人」（说话人跟随，需 ffmpeg），
-   并点「预览构图效果」抽样几帧看裁剪前后对照（预览里也能直接试这个开关）；
+   并用「没有人物时」下拉选择空镜那一段怎么显示（**默认「全画面适配」**），
+   并点「预览构图效果」抽样几帧看裁剪前后对照（预览里也能直接试这几个开关）；
    底部「输出体积 · 自动控制输出体积」勾选项即体积守护开关
+   —— 示意图右侧会按当前档位画出"无人时输出长什么样"，不用跑一遍也能看出来
 3. **执行处理**：整体 + 当前文件两级进度条，显示帧进度、裁剪模式、FPS 与剩余时间；
    「取消处理」在当前帧处理完后生效，输出要么完整要么不存在
 4. **结果汇总**：成功 / 跳过 / 失败列表与原因，一键打开输出文件夹
@@ -508,6 +674,132 @@ wheel 太大，断网重来代价太高，所以下载层专门做了三件事�
 > 版本默认跟随 `requirements.txt` 的锁定值（保证装完与仓库一致），读不到锁定值时才取索引最新版。
 > 装完需要**重启程序**才会用上 GPU（Python 进程内的 torch 无法热替换）。
 
+## 安装成 Windows 软件（Setup.exe）
+
+前面几节都是"开发者视角"（venv + pip）。如果要把程序**当成普通 Windows 软件**发给别人，
+用安装器：对方双击一个 exe，一路点"下一步"就能装好并直接用，**不需要预装 Python**。
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\setup_env.ps1 -Dev    # 需要 pyinstaller
+powershell -ExecutionPolicy Bypass -File scripts\build_installer.ps1   # 产出 dist\Video2PersonVideo-Setup.exe
+```
+
+发布时把 `dist\Video2PersonVideo-Setup.exe`（约 60~90 MB）单独发给对方即可，
+PyTorch / YOLO / OpenCV 都在对方机器上现下。
+
+### 装出来的是什么
+
+安装器**自己不带** PyTorch / YOLO / OpenCV（否则 Setup.exe 就是近 1 GB），
+它只带一份"安装逻辑 + 程序源码"；真正的重家伙在安装过程中按你的机器现下：
+
+```
+<安装目录>（默认 %LOCALAPPDATA%\Programs\Video2PersonVideo）
+├── install.json          # 安装状态（阶段进度 / 断点 / 用户选择；也是"这是安装目录"的标记）
+├── python/               # 内嵌的独立 Python 运行时（官方 embeddable 包）
+│   └── Lib/site-packages # 程序本体、PyTorch、ultralytics、PySide6 都装在这里
+├── app/                  # 程序本体（wheel / 源码）
+├── configs/              # 默认配置（可直接改的 YAML）
+├── assets/models/        # YOLO 权重（装完断网也能用）
+├── ffmpeg/bin/           # 可选：随包 ffmpeg（保留音轨 / H.264 / 说话人跟随）
+├── Video2PersonVideo.cmd # 双击开界面
+├── v2pv.cmd              # 命令行入口
+└── Uninstall.cmd         # 卸载入口
+```
+
+好处是**安装过程与用户的机器彻底解耦**：不碰系统 Python、不污染 conda，
+版本冲突无从发生；卸载 = 删一个目录。
+
+装完之后怎么用：
+
+- 桌面 / 开始菜单的「Video2PersonVideo」双击即开图形界面（等价于安装目录里的
+  `Video2PersonVideo.cmd`；没建快捷方式时直接双击这个 `.cmd` 也一样）；
+- 命令行：安装目录里的 `v2pv.cmd`（开始菜单文件夹里是「Video2PersonVideo」开界面入口
+  与「卸载 Video2PersonVideo」），`v2pv.cmd --check` 可核对环境；
+- 参数与源码安装完全一致（同一个 `v2pv`）；卸载走开始菜单 / 设置 → 应用 / `Uninstall.cmd`。
+
+### 向导里的四步
+
+1. **欢迎**：说明一次会做什么 + 许可条款；如果这台机器上**已经装过**或**上次装到一半**，
+   这里会出现状态卡片和「继续上次的安装 / 重新安装 / 卸载」三个按钮。
+2. **安装位置**：默认装在当前用户目录（**不需要管理员权限，不弹 UAC**），
+   实时显示目标磁盘剩余空间与预计占用；可勾选桌面 / 开始菜单快捷方式、
+   装完立即启动，以及"装完删除安装包"（默认保留，方便修复安装）。
+3. **组件**：先做一次硬件自检（CPU / 内存 / 每张显卡的型号 · 显存 · 驱动 · 算力），
+   给出**推荐的一套 PyTorch** 并说明理由；下拉里能改（不可用的档位会标注原因，
+   如"驱动支持的 CUDA 只到 12.6，装不了 CUDA 13.0"）；再选 YOLO 权重与随包 ffmpeg。
+   底部实时显示"要下载多少 / 装完占多少"。
+4. **安装**：阶段列表 + 当前文件进度 + 总进度 + 速度 / 剩余时间 / 续传字节 + 实时日志。
+
+### 安装过程中退出：在哪一步、怎么退出
+
+下载动辄 1~3 GB，中途关窗口是常态，所以**每一步都能安全退出**，而且界面会讲清楚后果：
+
+| 阶段 | 会写盘吗 | 在这一步退出的后果 | 下次 |
+|---|---|---|---|
+| 准备安装目录 | 只写 `install.json` | 只留一个状态文件 | 继续 / 直接回滚删掉空目录 |
+| 部署 Python 运行时 | 是 | `.part` 断点保留 | 从断点续传（已解压的部分不重来） |
+| 引导 pip | 是 | 同上 | 重跑一次引导（几秒） |
+| 下载安装 PyTorch | 是 | **断点完整保留** | 续传，已下好的 wheel 只校验不重下 |
+| 安装依赖 / 程序本体 | 是 | pip 可能停在半成品状态 | 重跑该步（pip 幂等，已装好的包不重复下载） |
+| 下载 YOLO 权重 | 是 | 断点保留（只有几 MB） | 续传 |
+| 部署 ffmpeg（可选） | 是 | 失败 / 退出都不影响安装成功 | 续传或跳过 |
+| 快捷方式 + 卸载登记 | 是 | 下次补做 | — |
+
+点「取消安装…」或直接关窗口时，会弹出**三选一**：
+
+- **继续安装**（默认）；
+- **暂停并退出**：先等当前数据块写完、断点落盘，再退出；
+  界面明确写出"已经下载 X GB，不会白下"；
+- **回滚并退出**：删掉这次已写入的文件、快捷方式与注册表项；
+  **已经下载的安装包默认保留**（在 `%LOCALAPPDATA%\Video2PersonVideo\cache`），
+  下次安装可以直接复用，不用重下几个 GB。
+
+再次运行安装器时，它会读 `install.json`：
+
+- 上次没装完 → 欢迎页给出「继续上次的安装」，从记录的那一步接着走；
+- 已经装好了 → 给出「重新安装」（重置阶段，但复用下载缓存）与「卸载」；
+- 安装目录被手工删了 → 提示"清理残留后重新安装"。
+
+命令行的等价能力（排错 / 批量部署用）：
+
+```powershell
+Video2PersonVideo-Setup.exe --list-backends                  # 这台机器能装哪几套 PyTorch
+Video2PersonVideo-Setup.exe --silent --backend cu126         # 静默安装（进度打到日志）
+Video2PersonVideo-Setup.exe --uninstall --quiet              # 静默卸载
+Video2PersonVideo-Setup.exe --repair                         # 重新安装（保留安装包）
+```
+
+### 卸载
+
+三种入口都指向同一个卸载器，**不依赖当初那个 Setup.exe 还在不在**：
+
+- 开始菜单 → `Video2PersonVideo` 文件夹 → 「卸载 Video2PersonVideo」；
+- 设置 → 应用 → 已安装的应用 → 「Video2PersonVideo」→ 卸载
+  （安装时写入了 `HKCU\...\Uninstall\Video2PersonVideo`）；
+- 安装目录里的 `Uninstall.cmd`。
+
+卸载会删除安装目录、快捷方式与注册表项；是否同时删掉已下载的安装包由界面上的勾选项决定
+（默认删，因为用户是主动卸载）。若安装目录里的解释器正在运行（卸载器自己就跑在里面），
+Windows 不允许删正在使用的 exe，卸载器会**安排一个后台脚本在退出后清理**并在界面上说明，
+而不是留一个删了一半的目录。
+
+### 打包说明
+
+| 开关 | 作用 |
+|---|---|
+| `scripts\build_installer.ps1` | 默认产出**单文件** `dist\Video2PersonVideo-Setup.exe`（约 60~90 MB） |
+| `-Dir` | 产出目录版（启动快、便于排错） |
+| `-Console` | 保留控制台窗口（调试 `--silent` 输出时用） |
+| `-SkipWheel` | 跳过 wheel 构建，复用 `build\installer_payload` |
+| `-VenvDir <dir>` | 用哪个虚拟环境打包（不存在会直接报错并提示先跑 `setup_env.ps1 -Dev`） |
+
+构建脚本先 `pip wheel` 把项目打成 wheel 塞进安装器的 payload（安装时直接装它，
+不需要目标机器有 setuptools），再交给 `build\Video2PersonVideo-Setup.spec` 打单文件 exe。
+spec 里显式排除了 torch / ultralytics / opencv / numpy，所以安装器体积极小。
+
+> 安装器与主程序是两个独立程序：主程序仍然是"可直接跑 / 可 PyInstaller 打包"的，
+> 安装器只是给最终用户多提供一条"像装软件一样装"的路。
+
 ## 打包成 Windows exe
 
 ```powershell
@@ -515,6 +807,10 @@ powershell -ExecutionPolicy Bypass -File scripts\setup_env.ps1 -Dev   # 需要 p
 powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1        # 目录版（推荐，启动快）
 powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1 -OneFile   # 单文件版
 ```
+
+两个脚本都接受 `-VenvDir <dir>` 指定用于打包的虚拟环境（默认 `.venv`）；没装好环境时
+脚本会直接报错并提示先跑 `setup_env.ps1 -Dev`。用 PyInstaller 手工打包则用
+`build\Video2PersonVideo.spec`（`V2PV_ONEFILE=1` 切单文件）。
 
 产物：
 
@@ -605,7 +901,8 @@ OpenCV 自带的人脸检测兜底，再退到按人框比例估算；三级都�
 1. `--multi-person-max`（默认 4）：超出的按"正在说话的人 > 主角打分"取舍；
 2. 格子太小：某档布局里最窄的格子短边不足 96 像素时，程序会主动少显示几个人
    （与其切成看不清的小方块，不如把留下的几个人显示清楚）；提高 `--target-size` 可以缓解；
-3. `--min-person-ratio`（默认 0.08）：低于该高度占比的人物算"背景里的路人"，不进窗口。
+3. `--min-person-ratio`（默认 0.73）：低于该高度占比的人物算"背景里的路人"，不算主要人物、
+   不进窗口。想让画面里占比很小的人也参与，把它调小（如 `0.15`）。
 
 结果汇总里的「多人分屏」「分屏布局」两行会说明本片用了哪些布局、各多少帧。
 想改排版就编辑布局表；想让画面里永远只有一个人，用 `--no-multi-person`
@@ -626,7 +923,22 @@ OpenCV 自带的人脸检测兜底，再退到按人框比例估算；三级都�
 
 **Q：镜头抖动厉害（画面在抖，但人物没怎么动）？**
 调低 `--smoothing-alpha`（如 `0.12`）；如果是对讲/直播素材，也可以把
-`--hold-frames` 调小，让无人时更快回到画面中心。
+`--hold-frames` 调小，让无人时更快切到**无人物显示**（默认「全画面适配」，
+镜头此时**完全不移动**，是最不容易看晕的一档）。
+
+**Q：画面里的人走开之后，画面变小了 / 上下有模糊的边？**
+这是默认的「全画面适配」：没有主要人物时把**整幅画面完整放进**输出画布，一帧看全、
+镜头不动；横屏素材转竖屏时上下必然空出一块，用同一帧的模糊放大版填充（不是黑边）。
+不想要这种留白可以换档：
+
+- `--no-person-mode tiles`：把纵向空间用起来 —— 上格放整幅画面，下格给画面里的
+  远景小人物开半身特写（`--no-person-tiles-max` 控制开几个）；
+- `--no-person-mode scan`：回到旧的空镜巡视（取景框缓慢扫过整幅画面）；
+- `--no-person-mode center`：不解释，直接取画面正中（最保守）；
+- `--no-blur-background`：留白改成纯色底色；
+- `--no-person-seconds 2`：过渡更慢更舒缓（0 = 直接切过去）；
+- 反过来，如果这类空镜很少、你更在意"别切少了"，把 `--hold-frames` 调大
+  （如 `90`）能让取景框多撑一会儿再切。
 
 **Q：提示 `无法创建输出视频`？**
 换 `.mp4` 后缀（编码器 `mp4v` 兼容性最好），或换成带编码器的 `opencv-python` 完整版
@@ -652,6 +964,12 @@ OpenCV 自带的人脸检测兜底，再退到按人框比例估算；三级都�
 优先上 GPU（`--device cuda:0`），其次换 `yolo11n.pt`、降低 `--imgsz`、加大
 `--detect-interval`（抽帧检测），最后关掉 `--reencode`。
 
+读帧与写盘已经默认与推理 / 裁剪重叠（后台线程），不需要额外设置；GPU 上再叠一个
+`--infer-batch 4~8` 收益明显（每帧的调用开销被摊薄）。另外两个容易白付的代价：
+整片始终只有一个人时可以用 `--no-speaker-tracking` 关掉说话人分析（单人画面本来
+就不会产生说话人偏置，结果一致）；输出体积超标时体积守护会整片重编码一遍
+（`--no-size-guard` 可关，代价是成品可能比原片大几倍）。
+
 ## 开发
 
 ```powershell
@@ -671,6 +989,9 @@ ruff check src tests
 - `tests/test_layout.py`：多人布局表（网格解析 / 权重划分 / 查表 / 配置加载，纯函数）
 - `tests/test_multi_person.py`：多人分屏流水线（每个窗口是谁、开关与回退、人数抖动、
   格子过小时自动少显示、抽帧插值、说话人占 1 号窗口、远景小人只切上半身）
+- `tests/test_no_person.py`：无人物显示（适配矩形 / 过渡几何不拉伸不越界 / 全景 + 特写
+  网格、完整放下与模糊底合成、不透明度、兜底时机与渐进过渡、自动退回全画面适配、
+  `scan` 与 `center` 两档的旧行为不变、配置规整与校验、端到端汇总）
 - `tests/test_pipeline.py`：抽帧插值、批量推理与逐帧结果的逐帧等价性
 - `tests/test_invariants.py`：**不变量验收门槛** + 端到端场景（合成视频 + 假检测器，无需模型）
 - `tests/test_batch.py` / `test_output.py`：批量遍历、失败隔离、音轨、元数据、临时文件清理
@@ -682,6 +1003,9 @@ ruff check src tests
   服务器不支持续传 / 续传位置不符的降级、`sha256` 校验、重试、取消保留断点
 - `tests/test_gui_smoke.py`：向导构建、参数收集、比例对话框校验（offscreen，无需显示器）
 - `tests/test_env_check.py`：本机环境速查（权重查找 / 就绪判断 / 一行摘要，不联网）
+- `tests/test_installer.py`：安装器（阶段与权重、状态文件读写与损坏兜底、续装 / 重置判定、
+  完整安装链路、PyTorch 下载中途取消后继续、可选组件失败降级、回滚保留 / 删除缓存；
+  用假下载器与假 pip，不联网、**不碰真实桌面快捷方式与注册表**）
 - `tests/test_setup_page.py`：自检页渲染（三步向导）、方案下拉的可用性标注、下载进度与状态流转
 - `tests/test_setup_worker.py`：自检后台线程（缓存状态上报、续传 / 丢弃断点、跳过已下载与 torch、
   未选任何项不算失败）
@@ -708,6 +1032,114 @@ ruff check src tests
 | pyinstaller / auto-py-to-exe | 6.22.3 / 2.50.1 | 打包 Windows 独立 exe |
 
 ## 变更记录
+
+### 未发布 · 处理提速（结果逐像素不变）
+
+- **批处理只加载一次模型**：`run_batch` 原先对每个视频都重新构造检测器（权重加载 +
+  推理器初始化，GPU 上还要建 CUDA 上下文 / 选卷积算法，几秒一个视频），
+  现在整批复用同一个实例（`processor.build_detector`）；加载失败仍退回
+  "逐个文件重试、各自报错"的旧行为
+- **ffprobe 结果缓存**（`utils/ffmpeg_tools.py:probe_media`）：按「路径 + 修改时间 + 大小」
+  缓存探测结果 —— 处理一个视频原来会把同一个源文件探测 5 次左右、中间产物各 2 次，
+  而每次都是一个独立子进程（实测 0.35s → 0.4ms）；文件被改写后自动失效，另提供
+  `clear_probe_cache()`
+- **嘴动分析改为按 ROI 惰性灰度**（`core/mouth.py:FrameGray`）：原先每个关键帧都要把整帧
+  转灰度（1080p 约 13ms/帧，比 GPU 上的 YOLO 前向还贵），而真正要看的只有"嘴"与
+  "上半脸"两块小矩形；现在只对用到的矩形做灰度（0.1ms 量级），人脸定位也只灰度搜索区。
+  灰度是**逐像素**运算，所以数值与整帧换算**逐位相同**（已验证：各矩形、越界矩形、
+  帧间差分都与旧口径一致）
+- **读帧预读 + 写帧异步**（`core/video_io.py`）：解码与 mp4v 编码放进后台线程，与主线程的
+  推理 / 裁剪重叠；帧序与内容与同步读写**逐字节一致**（端到端比对过
+  默认 / tiles / scan / center / 不裁剪 / 抽帧批量六种场景的输出 sha256 与逐帧像素）；
+  队列有背压、不会无限吃内存，写线程出错照常往上抛；设 `V2PV_SYNC_IO=1` 可一键
+  退回单线程读写（排错用）
+
+### 未发布 · 无人物显示（默认「全画面适配」）
+
+- 新增「画面里没有主要人物时怎么显示」的四档策略（`no_person_mode`，默认 `fit`），
+  替代原先"只能空镜巡视 / 回中"的单一兜底：
+  - `fit` **全画面适配**：整幅画面等比缩小完整放进输出画布，留白用**同一帧的模糊放大版**
+    填满（`blurred_cover`，降采样后模糊，代价可忽略）；一帧看全、镜头完全不移动 ——
+    横屏素材转竖屏时不再"只能看到局部"，也不再有持续横移带来的晕动感；
+  - `tiles` **全景 + 特写**：整幅画面收进上方通栏（`layout.tiles_layout`：首行高度 =
+    通栏宽 ÷ 源比例，画面正好填满那一格），下方纵向排列若干**次要小人物**的**上半身特写**
+    （复用 `compute_upper_body_box` 与 `build_anchors`，远景小人被放大成半身）；
+    特写窗口在过渡后半段淡入，画面"收进上格、下面顺势露出"；
+    没有够大的小人物、或竖屏里排不下（`MIN_CELL_PX`）时**自动退回全画面适配**；
+  - `scan`（空镜巡视）/ `center`（画面居中）保留原行为，一行配置即可换回
+- 过渡几何统一由 `layout.transition_frame` 给出：源侧"人物取景框 → 整幅画面"、画布侧
+  "整块画布 → 目标矩形"，**两端比例一起插值**（宽与中心线性插值、比例线性插值、高由比例
+  反推），因此中间每一帧都不拉伸、不越界、不出现空洞；进度按秒标定（`no_person_seconds`，
+  默认 0.8 秒）并做缓入缓出，与实际帧率无关
+- `crop.compose_multi_frame` 扩展：窗口支持 `fit=True`（**完整放下**而不是裁满格子）
+  与 `alpha`（淡入），画布底色支持 `blur=True`（同一帧的模糊放大版）；
+  `fit=False` + 纯色底时与旧行为**逐像素一致**（有测试兜住）
+- `BoxSmoother` 新增 `no_person_mode` / `no_person_seconds`：超时无人帧返回"正在取出的
+  那一块画面"（`MODE_FIT` / `MODE_TILES`）并暴露过渡几何；人物回来时进度归零，
+  从"整幅画面"平滑缩回人物身上
+- 新增 `core/noperson.py`：`NoPersonDisplay`（模糊底 / 特写数量 / 小人物下限）与
+  `TilesPlanner`（关键帧挑小人物、按帧尺寸缓存格子、按过渡进度给窗口）
+- 新增参数 `no_person_mode` / `no_person_seconds` / `no_person_blur` / `no_person_tiles_max` /
+  `no_person_secondary_ratio`；CLI `--no-person-mode` / `--no-person-seconds` /
+  `--[no-]blur-background` / `--no-person-tiles-max` / `--no-person-secondary-ratio`；
+  GUI 第 2 步新增「没有人物时」下拉，示意图右侧会按档位画出"无人时输出长什么样"，
+  「预览构图效果」与正片共用同一套排布逻辑
+- 结果汇总新增「无人物显示」一行（说清当前档位与"为什么没看到效果"），
+  「兜底帧数」补上全画面适配 / 全景+特写两类帧数
+- 新增测试 `tests/test_no_person.py`
+
+### 未发布 · 空镜巡视（无人物画面不再丢掉两侧内容）
+
+- 新增兜底第二级「空镜巡视」（`core/smoothing.py` 的 `MODE_SCAN`）：保持超时后画面里
+  仍然没有主要人物时，只要**源画面比目标取景框更大**（典型场景：横屏素材转竖屏），
+  取景框就沿那条多出来的轴按正弦缓动缓慢往返，几个来回把居中裁剪会丢掉的左右 / 上下
+  内容全部带到成片里；没有可巡视的空间（源比例与目标一致）或巡视被关闭时才回中
+- 巡视从"当前取景框所在的位置"起步（不会先倒着跑到一端），两端速度自然减到 0，
+  单程时长按秒标定并用真实帧率换算：24 / 30 / 60fps 素材的巡视速度与时长一致
+- 新增参数 `smoothing_scan_seconds` / CLI `--scan-seconds`（默认 `12.0` 秒，`0` = 关闭）；
+  结果汇总新增「空镜巡视 N 帧」，与"保持上一帧 / 回中"并列展示
+
+### 未发布 · 可视化安装包（Setup.exe）
+
+- 新增安装器 `video2personvideo.installer`：把程序当普通 Windows 软件安装，
+  **自带独立 Python 运行时**、按显卡现下 PyTorch、下好 YOLO 权重，
+  装完直接能用（不需要预装 Python、不需要管理员权限）
+  - `installer/gui/*`：五步向导（欢迎 / 位置 / 组件 / 进度 / 完成），
+    硬件自检给出推荐构建与理由，实时显示体积、速度、剩余时间与断点续传量
+  - `installer/engine.py`：安装引擎，阶段化执行
+    （准备目录 → 内嵌运行时 → pip → PyTorch → 依赖 → 程序本体 → YOLO → ffmpeg → 收尾），
+    每步结束都落盘，下载与 pip 都可中止
+  - `installer/journal.py`：安装状态文件 `install.json`（原子写 + 用户目录镜像），
+    据此判定"未装完 / 已装好 / 目录被删"，并支持从任意阶段重置或继续
+  - `installer/stages.py`：阶段模型，含权重（进度条按真实耗时分配）与
+    **每一步的中断说明**（"在这一步退出会发生什么、下次怎么继续"）
+  - `installer/runtime.py`：下载官方 embeddable Python 包 → 解压 → 改写 `._pth`
+    （把 `Lib/site-packages` 与 `import site` 补上，否则 pip 装进去的包 import 不到）
+    → 用 `get-pip.py` 引导 pip
+  - `installer/windows.py`：快捷方式（PowerShell + WScript.Shell，无 pywin32 依赖）、
+    卸载注册表项（出现在"应用和功能"）、下载缓存目录、启动入口、
+    **"自己删自己"的延迟清理脚本**（卸载器跑在安装目录里时用）
+  - `installer/payload.py`：随安装器的程序本体（wheel 或源码）、默认配置与依赖清单；
+    依赖清单**剔除 torch / torchvision**，避免 pip 把按显卡装的 CUDA 版覆盖成 CPU 版
+  - `installer/cli.py`：`--silent` 静默安装、`--uninstall` 卸载、`--repair` 重新安装、
+    `--list-backends` 列出可用构建
+- **中断语义**：取消 / 关窗口时弹三选一 —— 继续安装 / 暂停并退出（保留断点）/
+  回滚并退出（删已写入文件，但**默认保留已下载的安装包**）；
+  每个阶段都给出了对应的中断后果说明（见 README 表格）
+- 新增 `utils/app_paths.py`：安装布局与资源定位（安装根识别、模型目录、
+  随包 ffmpeg 目录、`register_bundled_tools()` 把随包目录挂到 PATH / DLL 搜索路径）
+  - `torch_install.model_directory()` / `wheel_directory()` / `default_requirements_path()`
+    改为走它，于是"源码跑 / PyInstaller 打包 / 安装器装出来的环境"三种形态都能找到资源
+  - `ffmpeg_tools.find_ffmpeg()` / `find_ffprobe()` 支持 `V2PV_FFMPEG` 与随包目录，
+    装出来的环境不需要用户自己装 ffmpeg
+- `utils/torch_install.py`：`build_plan()` 新增 `python_version` / `tags`
+  （把"给谁下 wheel"与"谁来下"分开，安装器要把 wheel 装进版本可能不同的内嵌解释器）；
+  新增 `run_process_streaming()`（逐行回显、可中止），`run_pip_streaming()` 改为它的薄封装
+- 新增打包配置 `build/Video2PersonVideo-Setup.spec`（安装器单文件 exe，
+  显式排除 torch / ultralytics / opencv / numpy）与一键脚本 `scripts/build_installer.ps1`
+- 新增 `v2pv-setup` 入口；新增测试 `tests/test_installer.py`
+  （阶段模型 / 状态日志与续装判定 / 完整安装链路 / 取消与续装 / 可选组件降级 / 回滚，
+  用假下载器与假 pip，不联网、不动真实桌面快捷方式与注册表）
 
 ### 未发布 · 跳过不必要的下载（本机环境速查）
 
@@ -820,8 +1252,9 @@ ruff check src tests
 - 新增 `SmoothingParams` 与「镜头跟随」档位预设（锁定 / 舒缓 / 标准 / 跟手），
   CLI `--camera-follow`、GUI 第 2 步与「预览构图效果」共用同一套预设
 - 新增参数 `smoothing_max_speed` / `smoothing_accel` / `smoothing_zoom_alpha` /
-  `smoothing_zoom_deadzone`；`smoothing_deadzone` 默认值 `0.02 → 0.15`
-  （旧默认几乎等于没有死区，人物一动镜头就跟着动）
+  `smoothing_zoom_deadzone`；`smoothing_deadzone` 默认值由 `0.02` 提高到 `0.15`
+  （「标准」档；此后默认档定为「跟手」`active`，其死区为 `0.06`）
+  —— 旧默认几乎等于没有死区，人物一动镜头就跟着动
 - 兜底回中改为「忽略死区 + 速度受限」：不再一帧跳到画面中心，也不会停在离中心一个死区的位置
 
 ### 0.2.0

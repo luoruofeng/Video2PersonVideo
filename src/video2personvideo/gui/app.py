@@ -21,10 +21,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
+    from ..utils.app_paths import register_bundled_tools
     from ..utils.logger import setup_logging
     from .setup_dialog import maybe_show_setup
     from .wizard import WizardWindow
 
+    register_bundled_tools()
     setup_logging("INFO")
     app = QApplication(argv if argv is not None else sys.argv)
     app.setApplicationName(theme.APP_NAME)

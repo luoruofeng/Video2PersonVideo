@@ -46,11 +46,13 @@ gui = ["PySide6-Essentials==6.11.2"]
 gui-pyqt = ["PyQt6==6.11.0"]
 # 打包成 Windows 独立 exe
 build = ["pyinstaller==6.22.3", "auto-py-to-exe==2.50.1"]
-# 开发调试
-dev = ["pytest==9.1.1", "pytest-cov>=6.0", "ruff==0.16.9"]
+# 开发调试（代码风格 / 静态检查）
+dev = ["ruff==0.16.9"]
 
 [project.scripts]
 v2pv = "video2personvideo.cli:main"
+# 安装 / 卸载入口（安装器装完后，注册表里的卸载命令用的就是它）
+v2pv-setup = "video2personvideo.installer.app:main"
 
 [project.urls]
 Homepage = "https://github.com/your-name/Video2PersonVideo"
@@ -63,22 +65,11 @@ include-package-data = true
 [tool.setuptools.packages.find]
 where = ["src"]
 
-[tool.pytest.ini_options]
-minversion = "8.0"
-testpaths = ["tests"]
-addopts = "-ra --strict-markers -m 'not slow'"
-markers = [
-    "slow: 需要下载模型/推理的慢速测试（默认跳过，用 RUN_SLOW=1 开启）",
-]
-
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-src = ["src", "tests"]
+src = ["src"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
 ignore = ["E501"]
-
-[tool.ruff.lint.per-file-ignores]
-"tests/*" = ["S101"]

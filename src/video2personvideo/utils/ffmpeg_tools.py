@@ -10,11 +10,13 @@ ultralytics/OpenCV 写出的视频不带音频，这里用 ffmpeg-python（探�
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import app_paths
 from .logger import get_logger
 
 logger = get_logger(__name__)
@@ -53,12 +55,28 @@ _MAX_FPS_UPSAMPLE = 3.0
 
 
 def find_ffmpeg() -> str | None:
-    """返回 ffmpeg 可执行文件路径，找不到返回 ``None``。"""
+    """返回 ffmpeg 可执行文件路径，找不到返回 ``None``。
+
+    查找顺序：``V2PV_FFMPEG`` 环境变量 → 随包目录（安装器装出来的
+    ``<安装根>/ffmpeg/bin``，见 :func:`app_paths.bundled_bin_dirs`）→ 系统 ``PATH``。
+    """
+    override = os.environ.get(app_paths.FFMPEG_ENV_VAR)
+    if override:
+        candidate = Path(override)
+        if candidate.is_file():
+            return str(candidate)
+        logger.debug("%s 指向的 ffmpeg 不存在：%s", app_paths.FFMPEG_ENV_VAR, override)
+    bundled = app_paths.find_bundled_executable("ffmpeg.exe", "ffmpeg")
+    if bundled is not None:
+        return bundled
     return shutil.which("ffmpeg")
 
 
 def find_ffprobe() -> str | None:
-    """返回 ffprobe 可执行文件路径，找不到返回 ``None``。"""
+    """返回 ffprobe 可执行文件路径，找不到返回 ``None``（查找顺序同 :func:`find_ffmpeg`）。"""
+    bundled = app_paths.find_bundled_executable("ffprobe.exe", "ffprobe")
+    if bundled is not None:
+        return bundled
     return shutil.which("ffprobe")
 
 
@@ -66,15 +84,56 @@ def ffmpeg_available() -> bool:
     return find_ffmpeg() is not None
 
 
+#: 探测结果缓存：键为 (路径, 修改时间 ns, 大小)，值为 ``probe_media`` 的返回值
+_PROBE_CACHE: dict[tuple[str, int, int], dict | None] = {}
+_PROBE_CACHE_MAX = 64
+
+
+def _cache_key(target: Path) -> str:
+    """缓存用的路径键：解析成绝对路径（同一文件的不同写法命中同一条）。"""
+    try:
+        return str(target.resolve())
+    except OSError:  # pragma: no cover - 极端路径
+        return str(target)
+
+
 def probe_media(path: str | Path) -> dict | None:
     """探测媒体流信息，失败返回 ``None``。
 
     优先用 ffmpeg-python 的 ``probe``，不可用时退回直接调用 ffprobe。
+
+    同一份文件的结果会按「路径 + 修改时间 + 大小」缓存：``ffprobe`` 是独立进程，
+    一次调用要几十到上百毫秒，而处理一个视频会对同一个文件探测好几次
+    （时间轴 / 音轨 / 时长 / 码率），短片段与批量场景下这笔开销相当可观。
+    返回的字典是**缓存对象，调用方只读、不要就地修改**；文件被改写
+    （时间戳或大小变化）后缓存自动失效。
     """
     target = Path(path)
-    if not target.exists():
+    try:
+        stat = target.stat()
+    except OSError:
+        return None
+    if not target.is_file():
         return None
 
+    key = (_cache_key(target), int(stat.st_mtime_ns), int(stat.st_size))
+    if key in _PROBE_CACHE:
+        return _PROBE_CACHE[key]
+
+    info = _probe_media_uncached(target)
+    if len(_PROBE_CACHE) >= _PROBE_CACHE_MAX:
+        _PROBE_CACHE.clear()
+    _PROBE_CACHE[key] = info
+    return info
+
+
+def clear_probe_cache() -> None:
+    """清空探测缓存（媒体文件被外部改写、或在长驻进程里换过文件时使用）。"""
+    _PROBE_CACHE.clear()
+
+
+def _probe_media_uncached(target: Path) -> dict | None:
+    """真正去调 ffmpeg-python / ffprobe 探测（不带缓存）。"""
     try:
         import ffmpeg  # ffmpeg-python
 

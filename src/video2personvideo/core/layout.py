@@ -449,6 +449,179 @@ def orientation_group(aspect_value: float) -> str:
     return "square"
 
 
+# --------------------------------------- 无人物显示：全画面适配 / 全景 + 特写
+
+
+def smoothstep(value: float) -> float:
+    """缓入缓出（0→0、1→1，两端速度为 0），让过渡的起步与收尾都不生硬。"""
+    t = min(max(float(value), 0.0), 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def _even_int(value: float, limit: int) -> int:
+    """四舍五入到偶数，并夹在 ``[2, limit]`` 内。"""
+    result = int(round(float(value)))
+    result -= result % 2
+    ceiling = max(int(limit), 2)
+    return min(max(result, 2), ceiling)
+
+
+@dataclass(frozen=True, slots=True)
+class TransitionFrame:
+    """过渡中某一帧的几何：**从源画面的哪一块切**、**贴到画布的哪个矩形**。
+
+    ``src`` 是源画面坐标下的浮点框 ``(x, y, w, h)``；``dst`` 是画布上的整型像素矩形
+    （宽高均为偶数）。两者的宽高比在每一帧都相等，因此贴图不会拉伸变形。
+    """
+
+    src: tuple[float, float, float, float]
+    dst: tuple[int, int, int, int]
+    progress: float
+
+
+def fit_rect(
+    frame_size: tuple[float, float], out_size: tuple[int, int]
+) -> tuple[int, int, int, int]:
+    """整幅画面等比放进画布后所占的矩形（居中，宽高均为偶数）。
+
+    源比例与画布比例一致时它等于整块画布；横屏素材转竖屏时会是一条扁带，
+    上下空出来的部分由裁剪层用模糊背景填满（不出现黑边）。
+    """
+    out_w, out_h = validate_out_size(out_size)
+    frame_w, frame_h = float(frame_size[0]), float(frame_size[1])
+    if frame_w <= 0.0 or frame_h <= 0.0:
+        raise ValueError(f"画面尺寸必须为正：{frame_w}x{frame_h}")
+
+    aspect = frame_w / frame_h
+    height = out_w / aspect
+    width = float(out_w)
+    if height > out_h:
+        height = float(out_h)
+        width = height * aspect
+    width = _even_int(width, out_w)
+    height = _even_int(height, out_h)
+    x = (out_w - width) // 2
+    y = (out_h - height) // 2
+    return x, y, width, height
+
+
+def _lerp_box(
+    start: tuple[float, float, float, float],
+    end: tuple[float, float, float, float],
+    t: float,
+) -> tuple[float, float, float, float]:
+    """按统一比例插值一个框：宽度与中心线性插值，**比例也在两端之间插值**。
+
+    "比例一起插值"是关键：只有这样，从"竖屏取景框"过渡到"整幅横屏画面"时，
+    中间每一帧的宽高比都与目标一致，画面不会被拉扁或拉长。
+    """
+    start_aspect = start[2] / start[3] if start[3] else 1.0
+    end_aspect = end[2] / end[3] if end[3] else 1.0
+    aspect = start_aspect + (end_aspect - start_aspect) * t
+    width = max(start[2] + (end[2] - start[2]) * t, 2.0)
+    height = max(width / aspect if aspect > 0.0 else width, 2.0)
+    center_x = (start[0] + start[2] / 2.0) + (
+        (end[0] + end[2] / 2.0) - (start[0] + start[2] / 2.0)
+    ) * t
+    center_y = (start[1] + start[3] / 2.0) + (
+        (end[1] + end[3] / 2.0) - (start[1] + start[3] / 2.0)
+    ) * t
+    return center_x - width / 2.0, center_y - height / 2.0, width, height
+
+
+def fit_box_in(
+    box: tuple[float, float, float, float], bounds: tuple[float, float, float, float]
+) -> tuple[float, float, float, float]:
+    """把框等比缩小到 ``bounds`` 之内并夹住位置（只缩不放大，比例不变）。"""
+    x, y, width, height = (float(value) for value in box)
+    left, top, bound_w, bound_h = (float(value) for value in bounds)
+    scale = 1.0
+    if width > bound_w > 0.0:
+        scale = min(scale, bound_w / width)
+    if height > bound_h > 0.0:
+        scale = min(scale, bound_h / height)
+    width = max(width * scale, 2.0)
+    height = max(height * scale, 2.0)
+    x = min(max(x, left), max(left + bound_w - width, left))
+    y = min(max(y, top), max(top + bound_h - height, top))
+    return x, y, width, height
+
+
+def transition_frame(
+    src_from: tuple[float, float, float, float],
+    src_to: tuple[float, float, float, float],
+    dst_from: tuple[float, float, float, float],
+    dst_to: tuple[float, float, float, float],
+    progress: float,
+) -> TransitionFrame:
+    """无人物帧的过渡几何：``src_from``/``dst_from`` → ``src_to``/``dst_to``。
+
+    典型用法是「人物刚离开时的取景框 → 整幅画面」（源侧）与
+    「整块画布 → 全画面适配矩形」（画布侧）。``progress = 0`` 时结果与"继续按人物
+    取景框裁剪"一致，``progress = 1`` 时就是完整的全画面适配；中间任何一帧都
+    不拉伸、不越界、不出现空洞（源框夹在 ``src_to`` 内、目标框夹在 ``dst_from`` 内）。
+
+    :param progress: 0~1 的过渡进度（内部做缓入缓出）
+    """
+    t = smoothstep(progress)
+    src = fit_box_in(_lerp_box(src_from, src_to, t), src_to)
+    aspect = src[2] / src[3] if src[3] > 0.0 else 1.0
+
+    dst = _lerp_box(dst_from, dst_to, t)
+    width = dst[2]
+    height = width / aspect if aspect > 0.0 else dst[3]
+    center_x = dst[0] + dst[2] / 2.0
+    center_y = dst[1] + dst[3] / 2.0
+    dst = fit_box_in(
+        (center_x - width / 2.0, center_y - height / 2.0, width, height), dst_from
+    )
+
+    out_w = _even_int(dst[2], int(dst_from[2]))
+    out_h = _even_int(dst[3], int(dst_from[3]))
+    x = min(max(int(round(dst[0])), 0), max(int(dst_from[2]) - out_w, 0))
+    y = min(max(int(round(dst[1])), 0), max(int(dst_from[3]) - out_h, 0))
+    return TransitionFrame(src=src, dst=(x, y, out_w, out_h), progress=t)
+
+
+def tiles_layout(
+    out_size: tuple[int, int],
+    frame_size: tuple[float, float],
+    details: int,
+    *,
+    gap: int = 0,
+    min_cell_px: int = MIN_CELL_PX,
+) -> GridLayout | None:
+    """「全景 + 特写」的纵向布局：第 1 行通栏放整幅画面，下面每行一个特写窗口。
+
+    与 :func:`auto_grid` 的区别在于**首行高度由源画面比例定死**（通栏宽度 ÷ 源比例），
+    于是全景那一格里的画面正好填满该格，不会再上下多出留白。
+
+    :param details: 下面放几个特写窗口（≥ 1）
+    :returns: 布局；首行就把画布吃掉大半、或特写行挤到短边不足 ``min_cell_px`` 时返回 ``None``
+    """
+    out_w, out_h = validate_out_size(out_size)
+    frame_w, frame_h = float(frame_size[0]), float(frame_size[1])
+    details = int(details)
+    if frame_w <= 0.0 or frame_h <= 0.0 or details <= 0:
+        return None
+    rows = details + 1
+    if rows > MAX_WINDOWS:
+        return None
+
+    gap = _clamp_gap(gap, out_w, out_h, rows, 1)
+    panorama = _even_int(out_w * frame_h / frame_w, out_h)
+    rest = out_h - panorama - gap * details
+    if rest < details * max(int(min_cell_px), 2):
+        return None
+
+    weight = rest / float(details)
+    return parse_grid(
+        [str(index) for index in range(1, rows + 1)],
+        row_weights=[float(panorama), *([weight] * details)],
+        label=f"全景 + {details} 特写",
+    )
+
+
 # ------------------------------------------------------------------ 布局策略
 
 
@@ -665,13 +838,19 @@ __all__ = [
     "GridLayout",
     "LayoutError",
     "MultiPersonPolicy",
+    "TransitionFrame",
     "auto_grid",
     "cell_ratio",
     "compute_cell_rects",
+    "fit_box_in",
     "fit_capacity",
+    "fit_rect",
     "load_multi_person_policy",
     "orientation_group",
     "parse_grid",
     "parse_layout_entry",
     "policy_from_mapping",
+    "smoothstep",
+    "tiles_layout",
+    "transition_frame",
 ]

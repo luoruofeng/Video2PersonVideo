@@ -17,8 +17,10 @@ from .pose import Keypoints
 #: 人物框：(x1, y1, x2, y2)，源画面像素坐标
 BBox = tuple[float, float, float, float]
 
-#: 默认主角最小高度占比：低于此值视为"没有人物"
-DEFAULT_MIN_HEIGHT_RATIO = 0.08
+#: 默认主角最小高度占比：低于此值视为"没有人物"（背景里的路人 / 小人）。
+#: 只认画面里占比足够大的人，数值调大后路人会被忽略；与
+#: :data:`~video2personvideo.core.framing.DEFAULT_MIN_PERSON_HEIGHT_RATIO` 保持一致。
+DEFAULT_MIN_HEIGHT_RATIO = 0.73
 
 
 @dataclass(frozen=True, slots=True)

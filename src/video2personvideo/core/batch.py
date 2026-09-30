@@ -20,7 +20,7 @@ from pathlib import Path
 
 from ..config import PERSON_SUFFIX, AppConfig
 from ..utils.logger import get_logger
-from .processor import ProcessResult, ProgressInfo, format_bytes, process_video
+from .processor import ProcessResult, ProgressInfo, build_detector, format_bytes, process_video
 
 logger = get_logger(__name__)
 
@@ -220,6 +220,16 @@ def run_batch(
     tasks = plan_tasks(sources, cfg)
     for directory in sorted({task.output.parent for task in tasks}, key=str):
         check_writable(directory)
+
+    if detector is None:
+        # 权重只加载一次，整批复用：模型加载 + 推理器初始化（GPU 上还有 CUDA 上下文 /
+        # 卷积算法选择）要花几秒，而它对每个视频的检测结果毫无影响。
+        # 加载失败时退回旧行为（交给 process_video 逐个文件重试并各自报错），绝不中断整批。
+        try:
+            detector = build_detector(cfg)
+        except Exception as exc:  # noqa: BLE001 - 模型不可用时按单个文件失败处理
+            logger.warning("检测器加载失败，改为逐个文件重试：%s", exc)
+            detector = None
 
     started = time.perf_counter()
     total = len(tasks)

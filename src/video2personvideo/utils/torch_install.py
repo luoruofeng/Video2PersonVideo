@@ -19,10 +19,12 @@ import platform
 import re
 import subprocess
 import sys
+import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import app_paths
 from .downloader import DownloadItem, remote_size
 from .gpu_probe import HardwareProfile, probe_hardware
 from .logger import get_logger
@@ -271,10 +273,13 @@ def pinned_versions(requirements: Path | None = None) -> dict[str, str]:
 
 
 def default_requirements_path() -> Path | None:
-    """定位仓库里的 ``requirements.txt``（打包后可能不存在）。"""
+    """定位 ``requirements.txt``（打包 / 安装器形态下可能不存在）。
+
+    顺序：当前工作目录 → 安装根 / 仓库根（:func:`app_paths.app_root`）。
+    """
     candidates = [
         Path.cwd() / "requirements.txt",
-        Path(__file__).resolve().parents[3] / "requirements.txt",
+        app_paths.app_root() / "requirements.txt",
     ]
     for candidate in candidates:
         if candidate.exists():
@@ -284,24 +289,18 @@ def default_requirements_path() -> Path | None:
 
 def wheel_directory(root: Path | None = None) -> Path:
     """wheel 缓存目录（断点文件也在这里，重开程序可以接着下）。"""
-    base = root or Path.home() / ".video2personvideo" / "wheels"
-    base.mkdir(parents=True, exist_ok=True)
-    return base
-
-
-def model_directory(root: Path | None = None) -> Path:
-    """YOLO 权重目录：优先仓库里的 ``assets/models``，否则退回用户目录。"""
     if root is not None:
         root.mkdir(parents=True, exist_ok=True)
         return root
-    project = Path(__file__).resolve().parents[3] / "assets" / "models"
-    try:
-        project.mkdir(parents=True, exist_ok=True)
-        return project
-    except OSError:  # pragma: no cover - 只读目录 / 打包环境
-        fallback = Path.home() / ".video2personvideo" / "models"
-        fallback.mkdir(parents=True, exist_ok=True)
-        return fallback
+    return app_paths.wheels_cache_dir()
+
+
+def model_directory(root: Path | None = None) -> Path:
+    """YOLO 权重目录：安装形态在安装根下，源码形态在仓库里，否则退回用户目录。"""
+    if root is not None:
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+    return app_paths.models_dir(create=True)
 
 
 # ------------------------------------------------------------------ 计划
@@ -313,15 +312,22 @@ def build_plan(
     with_sizes: bool = True,
     directory: Path | None = None,
     timeout: float = 30.0,
+    python_version: tuple[int, int] | None = None,
+    tags: Sequence[str] | None = None,
 ) -> InstallPlan:
-    """为某个 PyTorch 构建生成下载计划（联网抓索引，但只读页面不下载大文件）。"""
+    """为某个 PyTorch 构建生成下载计划（联网抓索引，但只读页面不下载大文件）。
+
+    ``python_version`` 与 ``tags`` 用来指定**目标解释器**而不是当前解释器：
+    安装器要把 wheel 装进随包的内嵌 Python（版本可能与安装器自己不同），
+    所以必须能把「给谁下」和「谁来下」分开。
+    """
     profile = profile or probe_hardware()
     pins = versions if versions is not None else pinned_versions()
     target_dir = directory or wheel_directory()
 
     plan = InstallPlan(backend=backend, directory=target_dir)
-    tag = python_tag()
-    tags = platform_tags(profile)
+    tag = python_tag(python_version)
+    tags = tuple(tags) if tags is not None else platform_tags(profile)
 
     html_by_package: dict[str, list[WheelEntry]] = {}
     for package in TORCH_PACKAGES:
@@ -417,6 +423,131 @@ def run_pip(
     return completed.returncode, output
 
 
+def pip_env() -> dict[str, str]:
+    """pip 子进程环境：静音版本检查 / 交互提示，输出不缓冲便于实时显示。"""
+    env = dict(os.environ)
+    env.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
+    env.setdefault("PIP_NO_INPUT", "1")
+    env.setdefault("PIP_PROGRESS_BAR", "off")
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    env.setdefault("PYTHONUTF8", "1")
+    return env
+
+
+def run_process_streaming(
+    command: Sequence[str],
+    *,
+    on_line=None,
+    stop=None,
+    timeout: float | None = None,
+    env: dict[str, str] | None = None,
+    cwd: str | Path | None = None,
+) -> tuple[int, str]:
+    """执行子进程，**逐行**把输出交给调用方；``stop()`` 为真时终止它。
+
+    返回 ``(退出码, 全部输出)``；被中止时退出码为 ``-1``
+    （调用方据此区分"失败"与"用户暂停"）。安装器用它跑 pip 与内嵌解释器脚本。
+    """
+    import queue
+    import threading
+
+    logger.info("执行：%s", " ".join(str(item) for item in command))
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
+    try:
+        process = subprocess.Popen(  # noqa: S603 - 参数由调用方拼好，无 shell
+            list(command),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env if env is not None else pip_env(),
+            cwd=str(cwd) if cwd is not None else None,
+            creationflags=flags,
+        )
+    except OSError as exc:
+        return 1, f"无法执行命令：{exc}"
+
+    stream = process.stdout
+    lines: "queue.Queue[str | None]" = queue.Queue()
+    if stream is not None:
+        def _pump() -> None:
+            try:
+                for line in stream:
+                    lines.put(line)
+            finally:
+                lines.put(None)
+
+        threading.Thread(target=_pump, daemon=True, name="process-output").start()
+
+    started = time.monotonic()
+    collected: list[str] = []
+    cancelled = False
+    drained = False
+    while not drained:
+        try:
+            line = lines.get(timeout=0.2)
+        except queue.Empty:
+            line = ""
+        if line is None:
+            drained = True
+            break
+        if line:
+            text = line.rstrip()
+            collected.append(text)
+            if on_line is not None:
+                try:
+                    on_line(text)
+                except Exception as exc:  # noqa: BLE001 - 界面回调出错不该影响安装
+                    logger.debug("子进程输出回调异常：%s", exc)
+        if stop is not None and stop():
+            cancelled = True
+            logger.info("收到中止请求，正在结束 pip…")
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:  # pragma: no cover - 依赖真实进程
+                process.kill()
+            break
+        if timeout is not None and time.monotonic() - started > timeout:  # pragma: no cover
+            logger.warning("pip 执行超时（%.0f 秒），强制结束", timeout)
+            process.terminate()
+            break
+
+    try:
+        code = process.wait(timeout=30)
+    except subprocess.TimeoutExpired:  # pragma: no cover
+        process.kill()
+        code = -1
+    output = "\n".join(collected)
+    if cancelled:
+        return -1, output
+    return code, output
+
+
+def run_pip_streaming(
+    args: Sequence[str],
+    *,
+    python: str | None = None,
+    on_line=None,
+    stop=None,
+    timeout: float | None = None,
+    env: dict[str, str] | None = None,
+    cwd: str | Path | None = None,
+) -> tuple[int, str]:
+    """执行 ``python -m pip <args>``，逐行回显且可中止（见 :func:`run_process_streaming`）。"""
+    interpreter = python or sys.executable
+    return run_process_streaming(
+        [interpreter, "-m", "pip", *args],
+        on_line=on_line,
+        stop=stop,
+        timeout=timeout,
+        env=env,
+        cwd=cwd,
+    )
+
+
 def install_plan(
     plan: InstallPlan,
     *,
@@ -476,9 +607,12 @@ __all__ = [
     "parse_index",
     "pick_version",
     "pinned_versions",
+    "pip_env",
     "platform_tags",
     "python_tag",
     "run_pip",
+    "run_pip_streaming",
+    "run_process_streaming",
     "wheel_directory",
     "yolo_items",
 ]

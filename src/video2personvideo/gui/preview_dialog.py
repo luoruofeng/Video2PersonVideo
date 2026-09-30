@@ -29,20 +29,31 @@ from PySide6.QtWidgets import (
 )
 
 from ..config import AppConfig
-from ..core.crop import WindowSlice, compose_multi_frame, crop_frame
-from ..core.framing import center_box, compute_target_box, mode_label
+from ..core.crop import DEFAULT_BACKGROUND, WindowSlice, compose_multi_frame, crop_frame
+from ..core.framing import MODE_TILES, compute_target_box, mode_label
+from ..core.layout import TransitionFrame, fit_rect
 from ..core.multi import plan_static_multi
+from ..core.noperson import TilesPlanner, whole_frame_box
 from ..core.ratio import AspectRatio
 from ..core.smoothing import (
     CAMERA_PRESETS,
+    DEFAULT_NO_PERSON_MODE,
+    NO_PERSON_LABELS,
+    NO_PERSON_MODES,
     PRESET_FIELDS,
     match_preset,
+    no_person_mode_label,
     preset_values,
 )
 from ..core.subject import Detection, select_subject
 from ..core.video_io import VideoReader
 from . import theme
-from .pages.ratio_page import CUSTOM_FOLLOW_KEY, FOLLOW_TOOLTIP, MULTI_PERSON_TOOLTIP
+from .pages.ratio_page import (
+    CUSTOM_FOLLOW_KEY,
+    FOLLOW_TOOLTIP,
+    MULTI_PERSON_TOOLTIP,
+    NO_PERSON_TOOLTIP,
+)
 
 #: 抽样帧数
 SAMPLE_COUNT = 5
@@ -143,6 +154,9 @@ class PreviewDialog(QDialog):
             "headroom": cfg.headroom,
             "multi_person": bool(cfg.multi_person),
         }
+        self._no_person = (
+            cfg.no_person_mode if cfg.no_person_mode in NO_PERSON_MODES else DEFAULT_NO_PERSON_MODE
+        )
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(theme.SPACING_LARGE, theme.SPACING_LARGE,
@@ -191,7 +205,7 @@ class PreviewDialog(QDialog):
         form.addRow("镜头跟随", self.follow_combo)
 
         self.person_slider, person_row = self._slider(
-            1, 60, int(self._render_params["min_person_height_ratio"] * 100)
+            1, 90, int(self._render_params["min_person_height_ratio"] * 100)
         )
         form.addRow("人物最小占比", person_row)
 
@@ -205,6 +219,16 @@ class PreviewDialog(QDialog):
         self.multi_box.setToolTip(MULTI_PERSON_TOOLTIP)
         self.multi_box.stateChanged.connect(self._on_tuning_changed)
         form.addRow("多人分屏", self.multi_box)
+
+        self.no_person_combo = QComboBox()
+        self.no_person_combo.setToolTip(NO_PERSON_TOOLTIP)
+        for mode in NO_PERSON_MODES:
+            self.no_person_combo.addItem(NO_PERSON_LABELS[mode], mode)
+        self.no_person_combo.setCurrentIndex(
+            max(self.no_person_combo.findData(self._no_person), 0)
+        )
+        self.no_person_combo.currentIndexChanged.connect(self._on_tuning_changed)
+        form.addRow("没有人物时", self.no_person_combo)
         return group
 
     def _slider(self, minimum: int, maximum: int, value: int) -> tuple[QSlider, QWidget]:
@@ -235,6 +259,10 @@ class PreviewDialog(QDialog):
     def multi_person(self) -> bool:
         """预览里试出来的"多人分屏"开关（确认后回写到设置页）。"""
         return self.multi_box.isChecked()
+
+    def no_person_mode(self) -> str:
+        """预览里试出来的"没有人物时"显示方式（确认后回写到设置页）。"""
+        return str(self.no_person_combo.currentData())
 
     # ------------------------------------------------------------- 后台任务
     def _start(self) -> None:
@@ -284,6 +312,7 @@ class PreviewDialog(QDialog):
 
     def _on_tuning_changed(self) -> None:
         self._render_params = {**self.tuning(), "multi_person": self.multi_box.isChecked()}
+        self._no_person = str(self.no_person_combo.currentData())
         if self._samples:
             self._render()
 
@@ -291,15 +320,19 @@ class PreviewDialog(QDialog):
         if not self._samples:
             return
 
-        cfg = replace(self._cfg, **self._render_params)
+        cfg = replace(
+            self._cfg, **self._render_params, no_person_mode=self._no_person
+        )
         params = cfg.framing_params()
         weights = cfg.subject_weights()
         ratio = cfg.resolve_ratio()
-        policy = cfg.multi_person_policy() if cfg.multi_person else None
+        # 布局外观（底色 / 缝隙）无论是否开启多人分屏都要用，故单独取一份
+        display_policy = cfg.multi_person_policy()
+        policy = display_policy if cfg.multi_person else None
 
         rows = [
             self._render_row(
-                sample, ratio, params, weights, cfg.min_person_height_ratio, policy
+                sample, cfg, ratio, params, weights, policy, display_policy
             )
             for sample in self._samples
         ]
@@ -326,15 +359,17 @@ class PreviewDialog(QDialog):
     def _render_row(
         self,
         sample: dict,
+        cfg: AppConfig,
         ratio: AspectRatio,
         params,
         weights,
-        min_person_ratio: float,
         policy=None,
+        display_policy=None,
     ) -> np.ndarray:
         frame = sample["frame"]
         detections = sample["detections"]
         frame_size = (float(frame.shape[1]), float(frame.shape[0]))
+        min_person_ratio = cfg.min_person_height_ratio
 
         windows: list[WindowSlice] | None = (
             plan_static_multi(
@@ -363,14 +398,29 @@ class PreviewDialog(QDialog):
                 weights=weights,
                 min_height_ratio=min_person_ratio,
             )
-            box = (
-                compute_target_box(subject.bbox, frame_size, ratio, params)
-                if subject is not None
-                else center_box(frame_size, ratio)
-            )
-            cropped = crop_frame(frame, box, ratio.target_size)
-            boxes = [box]
-            title = mode_label(box.mode)
+            if subject is None:
+                # 没有主要人物：按"没有人物时"的档位预览（整幅画面 / 全景 + 特写）
+                windows = _no_person_windows(
+                    cfg, frame_size, ratio, detections, params, display_policy
+                )
+                background = (
+                    display_policy.background if display_policy is not None else DEFAULT_BACKGROUND
+                )
+                cropped = compose_multi_frame(
+                    frame,
+                    windows,
+                    ratio.target_size,
+                    background=background,
+                    annotate=False,
+                    blur=cfg.no_person_blur,
+                )
+                boxes = [window.box for window in windows]
+                title = f"无人物：{no_person_mode_label(cfg.no_person_mode)}"
+            else:
+                box = compute_target_box(subject.bbox, frame_size, ratio, params)
+                cropped = crop_frame(frame, box, ratio.target_size)
+                boxes = [box]
+                title = mode_label(box.mode)
 
         source_view = _fit_height(_draw_boxes(frame, boxes), TILE_HEIGHT)
         crop_view = _fit_height(cropped, TILE_HEIGHT)
@@ -385,6 +435,49 @@ class PreviewDialog(QDialog):
         )
         gap = np.full((TILE_HEIGHT, 8, 3), 255, dtype=np.uint8)
         return np.hstack([source_view, gap, crop_view])
+
+
+def _no_person_windows(
+    cfg: AppConfig,
+    frame_size: tuple[float, float],
+    ratio: AspectRatio,
+    detections: list[Detection],
+    params,
+    policy,
+) -> list[WindowSlice]:
+    """画面里没有主要人物时，这一帧会贴哪些窗口（预览用）。
+
+    直接复用正片的排布逻辑（:class:`TilesPlanner` + ``fit_rect``），
+    于是"预览看到的"与"正片输出的"是同一套几何，不会各说各话。
+    """
+    if cfg.no_person_mode == MODE_TILES and policy is not None:
+        planner = TilesPlanner(
+            ratio,
+            params=params,
+            policy=policy,
+            min_person_height_ratio=cfg.min_person_height_ratio,
+            secondary_ratio=cfg.no_person_secondary_ratio,
+            max_details=cfg.no_person_tiles_max,
+        )
+        planner.update(detections, frame_size)
+        cell = planner.dst_rect(frame_size)
+        if cell is not None:
+            prepared = planner.windows(
+                frame_size,
+                TransitionFrame(
+                    src=(0.0, 0.0, float(frame_size[0]), float(frame_size[1])),
+                    dst=cell,
+                    progress=1.0,
+                ),
+            )
+            if prepared:
+                return prepared
+
+    return [
+        WindowSlice(
+            whole_frame_box(frame_size), fit_rect(frame_size, ratio.target_size), fit=True
+        )
+    ]
 
 
 def _draw_boxes(frame: np.ndarray, boxes) -> np.ndarray:

@@ -12,7 +12,8 @@ from .core.batch import discover_videos, run_batch
 from .core.layout import MAX_WINDOWS
 from .core.processor import process_video
 from .core.ratio import preset_names
-from .core.smoothing import CAMERA_PRESETS
+from .core.smoothing import CAMERA_PRESETS, NO_PERSON_MODES
+from .utils.app_paths import register_bundled_tools
 from .utils.device import environment_report, format_report
 from .utils.logger import get_logger, setup_logging
 
@@ -86,7 +87,7 @@ def build_parser() -> argparse.ArgumentParser:
     crop_group.add_argument(
         "--camera-follow",
         choices=list(CAMERA_PRESETS),
-        help="镜头跟随档位：锁定 / 舒缓 / 标准 / 跟手，一次设置一组平滑参数（更稳 = 更不易看晕）",
+        help="镜头跟随档位：锁定 / 舒缓 / 标准 / 跟手（默认跟手），一次设置一组平滑参数（更稳 = 更不易看晕）",
     )
     crop_group.add_argument(
         "--smoothing-alpha",
@@ -119,6 +120,52 @@ def build_parser() -> argparse.ArgumentParser:
         help="镜头平移速度上限（相对框长/帧），防止甩镜；0 = 不限制",
     )
     crop_group.add_argument("--hold-frames", type=int, dest="hold_frames", help="丢失目标后保持取景框的帧数")
+    crop_group.add_argument(
+        "--no-person-mode",
+        choices=list(NO_PERSON_MODES),
+        dest="no_person_mode",
+        help=(
+            "画面里没有主要人物时怎么显示（默认 fit）："
+            "fit = 全画面适配（整幅画面缩小完整放入，镜头不动、一帧看全）；"
+            "tiles = 全景 + 特写（整幅画面收进上方通栏，下面给远景小人物开半身特写窗口）；"
+            "scan = 空镜巡视（取景框缓慢扫过整幅画面）；"
+            "center = 只取画面正中"
+        ),
+    )
+    crop_group.add_argument(
+        "--no-person-seconds",
+        type=float,
+        dest="no_person_seconds",
+        help="从人物取景框过渡到无人物显示的时长（秒），越大越舒缓；0 = 立即切换",
+    )
+    crop_group.add_argument(
+        "--blur-background",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        dest="no_person_blur",
+        help="无人物画面的底色用「同一帧的模糊放大版」而不是纯色（--no-blur-background 关闭）",
+    )
+    crop_group.add_argument(
+        "--no-person-tiles-max",
+        type=int,
+        dest="no_person_tiles_max",
+        help="「全景 + 特写」最多给几个远景小人物开特写窗口（1~4，默认 2）",
+    )
+    crop_group.add_argument(
+        "--no-person-secondary-ratio",
+        type=float,
+        dest="no_person_secondary_ratio",
+        help="「全景 + 特写」里小人物的高度下限（占画面比例）：低于它的不给特写（默认 0.12）",
+    )
+    crop_group.add_argument(
+        "--scan-seconds",
+        type=float,
+        dest="smoothing_scan_seconds",
+        help=(
+            "「空镜巡视」的单程时长（秒）：取景框缓慢平移扫过整幅画面，"
+            "只在 --no-person-mode scan 时用得上；0 = 关闭巡视、退回画面居中"
+        ),
+    )
     crop_group.add_argument("--min-person-ratio", type=float, dest="min_person_height_ratio", help="人物过小阈值（bbox 高 / 画面高）")
     crop_group.add_argument("--headroom", type=float, help="半身构图的头顶留白比例")
     crop_group.add_argument(
@@ -242,6 +289,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     """命令行主函数，返回进程退出码。"""
+    # 安装器会把 ffmpeg 之类的随包可执行文件放在安装目录下；先挂到 PATH 上，
+    # 这样 shutil.which / 子进程调用都能直接命中，不必再去改各调用点。
+    register_bundled_tools()
+
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -384,6 +435,12 @@ def _override_kwargs(args: argparse.Namespace) -> dict[str, object]:
         "use_keypoints": False if args.no_keypoints else None,
         **_smoothing_kwargs(args),
         "hold_frames": args.hold_frames,
+        "smoothing_scan_seconds": args.smoothing_scan_seconds,
+        "no_person_mode": args.no_person_mode,
+        "no_person_seconds": args.no_person_seconds,
+        "no_person_blur": args.no_person_blur,
+        "no_person_tiles_max": args.no_person_tiles_max,
+        "no_person_secondary_ratio": args.no_person_secondary_ratio,
         "min_person_height_ratio": args.min_person_height_ratio,
         "headroom": args.headroom,
         "speaker_tracking": args.speaker_tracking,

@@ -25,20 +25,23 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from ..utils.logger import get_logger
-from .crop import WindowSlice, crop_frame
+from .crop import WindowSlice, compose_multi_frame, crop_frame
 from .framing import (
     DEFAULT_FRAMING_PARAMS,
     DEFAULT_MIN_PERSON_HEIGHT_RATIO,
+    MODE_FIT,
     MODE_MULTI,
+    MODE_TILES,
     CropBox,
     FramingParams,
     compute_target_box,
     interpolate_boxes,
     mode_label,
 )
-from .layout import MultiPersonPolicy
+from .layout import DEFAULT_MULTI_PERSON_POLICY, MultiPersonPolicy
 from .mouth import FaceLocator, MouthActivityAnalyzer
 from .multi import MultiPersonComposer, MultiPlan
+from .noperson import NoPersonDisplay, TilesPlanner
 from .pose import build_anchors
 from .ratio import AspectRatio
 from .smoothing import BoxSmoother
@@ -59,7 +62,8 @@ class FrameOutcome:
     mode: str
     box: CropBox | None
     subject_bbox: tuple[float, float, float, float] | None = None
-    #: 多人分屏时的各窗口（空列表 = 本帧是单窗口 / 兜底画面）
+    #: 需要拼接的窗口（空列表 = 本帧是单窗口裁剪）：多人分屏、无人物时的
+    #: 「全画面适配 / 全景 + 特写」都走这里
     windows: list[WindowSlice] = field(default_factory=list)
 
     @property
@@ -68,7 +72,7 @@ class FrameOutcome:
 
     @property
     def is_multi(self) -> bool:
-        """本帧是否走了多人分屏。"""
+        """本帧是否由多个窗口拼成（多人分屏 / 无人物兜底），画框标注已在拼接时画好。"""
         return bool(self.windows)
 
     @property
@@ -99,6 +103,10 @@ class PipelineStats:
     multi_frames: int = 0
     #: 单帧最多同时显示了几个窗口
     windows_peak: int = 0
+    #: 以「全画面适配」输出的帧数（画面里没有主要人物、且显示方式为 fit）
+    fit_frames: int = 0
+    #: 以「全景 + 特写」输出的帧数（画面里没有主要人物、且显示方式为 tiles）
+    tiles_frames: int = 0
     modes: Counter = field(default_factory=Counter)
 
     def as_dict(self) -> dict[str, int]:
@@ -130,6 +138,7 @@ class CropPipeline:
         mouth: MouthActivityAnalyzer | None = None,
         speaker_weight: float = 0.0,
         multi: MultiPersonPolicy | None = None,
+        no_person: NoPersonDisplay | None = None,
     ) -> None:
         self.ratio = ratio
         self.detector = detector
@@ -168,6 +177,26 @@ class CropPipeline:
             else None
         )
 
+        #: 无人物帧的显示外观：模糊底色、「全景 + 特写」的特写数量与小人物下限
+        #: （显示方式本身在 ``smoother.params.no_person_mode`` 里，两者同源于 AppConfig）
+        self.no_person = no_person or NoPersonDisplay()
+        #: 布局外观（底色 / 缝隙）与多人分屏共用一套，视觉语言保持一致
+        self.display_policy = multi if multi is not None else DEFAULT_MULTI_PERSON_POLICY
+        #: 「全景 + 特写」的排布（仅显示方式为 tiles 时构造）
+        self.tiles: TilesPlanner | None = (
+            TilesPlanner(
+                ratio,
+                params=params,
+                policy=self.display_policy,
+                min_person_height_ratio=self.min_person_height_ratio,
+                secondary_ratio=self.no_person.secondary_ratio,
+                max_details=self.no_person.tiles_max,
+                annotate=self.annotate,
+            )
+            if self.smoother.no_person_mode == MODE_TILES and self.no_person.tiles_max > 0
+            else None
+        )
+
         self._prev_detect_index: int | None = None
         self._prev_target: CropBox | None = None
         self._prev_bbox: tuple[float, float, float, float] | None = None
@@ -202,6 +231,26 @@ class CropPipeline:
     @property
     def center_frames(self) -> int:
         return self.smoother.centers
+
+    @property
+    def scan_frames(self) -> int:
+        """以「空镜巡视」输出的帧数（画面里没有主要人物、且源画面比取景框更大）。"""
+        return self.smoother.scans
+
+    @property
+    def fit_frames(self) -> int:
+        """以「全画面适配」输出的帧数（画面里没有主要人物时的默认显示方式）。"""
+        return self.stats.fit_frames
+
+    @property
+    def tiles_frames(self) -> int:
+        """以「全景 + 特写」输出的帧数（没有主要人物，但有值得特写的远景小人物）。"""
+        return self.stats.tiles_frames
+
+    @property
+    def no_person_mode(self) -> str:
+        """画面里没有主要人物时的显示方式（见 ``core.smoothing.NO_PERSON_MODES``）。"""
+        return self.smoother.no_person_mode
 
     # ------------------------------------------------------------- 帧率校准
     def set_fps(self, fps: float | None) -> None:
@@ -274,6 +323,9 @@ class CropPipeline:
                 if self.composer is not None
                 else None
             )
+            if self.tiles is not None:
+                # 「全景 + 特写」的候选只关键帧才重新挑（填充帧沿用上一次的）
+                self.tiles.update(detections, frame_size)
 
             subject = None
             target = None
@@ -439,17 +491,74 @@ class CropPipeline:
         person_count: int,
     ) -> FrameOutcome:
         frame_size = (float(frame.shape[1]), float(frame.shape[0]))
-        box = self.smoother.update(target, frame_size)
-        output = crop_frame(frame, box, self.out_size) if self.crop else frame
+        box = self.smoother.update(
+            target, frame_size, fallback_dst=self._tiles_dst(frame_size, target)
+        )
+
+        windows = self._fallback_windows(frame_size, box, target)
+        if windows is not None:
+            output = compose_multi_frame(
+                frame,
+                windows,
+                self.out_size,
+                background=self.display_policy.background,
+                annotate=self.annotate,
+                blur=self.no_person.blur,
+            )
+            mode = box.mode
+            if mode == MODE_FIT:
+                self.stats.fit_frames += 1
+            else:
+                self.stats.tiles_frames += 1
+        else:
+            output = crop_frame(frame, box, self.out_size) if self.crop else frame
+            mode = box.mode
 
         self.stats.frames += 1
-        self.stats.modes[box.mode] += 1
+        self.stats.modes[mode] += 1
         return FrameOutcome(
             index=index,
             frame=output,
             person_count=person_count,
             has_person=target is not None,
-            mode=box.mode,
+            mode=mode,
             box=box,
             subject_bbox=self._prev_bbox,
+            windows=windows or [],
         )
+
+    def _tiles_dst(
+        self, frame_size: tuple[float, float], target: CropBox | None
+    ) -> tuple[int, int, int, int] | None:
+        """本帧"全景窗口"该占哪一格（只有"全景 + 特写"用得上）。
+
+        提前算出来交给平滑器，画面就会**直接收进上格**，而不是先拉到画布正中再跳上去；
+        没有特写可放（画面里没有够大的小人物）时返回 ``None``，此时退回"全画面适配"。
+        """
+        if self.tiles is None or target is not None:
+            return None
+        return self.tiles.dst_rect(frame_size)
+
+    def _fallback_windows(
+        self,
+        frame_size: tuple[float, float],
+        box: CropBox,
+        target: CropBox | None,
+    ) -> list[WindowSlice] | None:
+        """无人物帧要拼接的窗口列表；``None`` = 本帧不是无人物兜底。
+
+        返回 ``None`` 时调用方按普通取景框裁剪，与旧行为逐像素一致。
+        """
+        if target is not None:
+            return None
+        transition = self.smoother.transition
+        if transition is None or box.mode not in (MODE_FIT, MODE_TILES):
+            return None
+
+        if box.mode == MODE_TILES and self.tiles is not None:
+            windows = self.tiles.windows(frame_size, transition)
+            if windows:
+                return windows
+            # 放不下特写：退回全画面适配（模式也一起改，别让统计与画面不一致）
+            box.mode = MODE_FIT
+        return [WindowSlice(box, transition.dst, fit=True)]
