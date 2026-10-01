@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from ...core.framing import DEFAULT_FRAMING_PARAMS, DEFAULT_MIN_PERSON_HEIGHT_RATIO
+from ...core.subject import DEFAULT_MIN_PERSON_SHARPNESS
 from ...core.ratio import PRESET_RATIOS, AspectRatio
 from ...core.smoothing import (
     CAMERA_PRESETS,
@@ -58,8 +59,21 @@ MULTI_PERSON_TOOLTIP = (
     "· 关掉它 = 整段视频同时只显示一个人\n"
     "· 窗口怎么排（谁的窗口放哪、每格多大）由 configs/multi_person_layout.yaml\n"
     "  按「输出比例 + 人数」查表决定，可自行修改\n"
+    "· 正在说话的人优先坐 1 号窗口（通常最大 / 最靠上），其余按画面位置入座\n"
     "· 背景里的小人 / 路人不算主要人物，不会进窗口\n"
-    "· 单人画面不受影响：输出与关闭该功能时完全一致"
+    "· 单人画面不受影响：输出与关闭该功能时完全一致\n"
+    "· 「分屏窗口稳定跟随」默认开启，见下面那一项"
+)
+
+#: 「分屏窗口稳定跟随」勾选项的提示语
+MULTI_STABLE_TOOLTIP = (
+    "多人分屏时，每个小窗口都按「正常速度」播放（推荐保持勾选）：\n"
+    "· 窗口镜头按秒封顶：每秒最多平移半个窗口宽度，不会飞快地平移 / 推拉\n"
+    "· 窗口很“懒”：人物在窗口里说话、晃动时镜头完全不动，只有快到窗口边缘才跟\n"
+    "· 窗口固定跟人：谁坐哪个窗口就一直是这个窗口，不因说话人变化而互换内容\n"
+    "· 万不得已要换人时直接切镜头，而不是从旧人物身上快速扫过去\n"
+    "取消勾选 = 沿用上面的「镜头跟随」档位直接套在每个小窗口上：\n"
+    "小窗口面积小、放大倍数高，同样的镜头运动看起来会很急（像快进）。"
 )
 
 #: 「无人物显示」下拉的提示语
@@ -165,6 +179,15 @@ class RatioPage(QWidget):
         )
         form.addRow("人物最小占比", person_row)
 
+        sharpness_default = int(round(DEFAULT_MIN_PERSON_SHARPNESS * 100))
+        self.sharpness_slider, sharpness_row = self._make_slider(0, 100, sharpness_default)
+        self.sharpness_slider.setToolTip(
+            "人物清晰度下限：与「人物最小占比」并列，两者都达标才算主要人物。\n"
+            "被镜头虚化的人（背景里的路人、远处海报 / 屏幕里的人）即便占比很大，\n"
+            "清晰度不达标也会被当成背景人物。默认 0.30；0 = 关闭这项判定。"
+        )
+        form.addRow("人物清晰度下限", sharpness_row)
+
         headroom_default = int(round(DEFAULT_FRAMING_PARAMS.headroom * 100))
         self.headroom_slider, headroom_row = self._make_slider(0, 30, headroom_default)
         self.headroom_slider.setToolTip("半身构图时头顶留白占取景框高度的比例")
@@ -175,6 +198,12 @@ class RatioPage(QWidget):
         self.multi_person_box.setToolTip(MULTI_PERSON_TOOLTIP)
         self.multi_person_box.stateChanged.connect(lambda _: self.tuningChanged.emit())
         form.addRow("多人分屏", self.multi_person_box)
+
+        self.multi_stable_box = QCheckBox("分屏窗口稳定跟随（推荐）")
+        self.multi_stable_box.setChecked(True)
+        self.multi_stable_box.setToolTip(MULTI_STABLE_TOOLTIP)
+        self.multi_stable_box.stateChanged.connect(lambda _: self.tuningChanged.emit())
+        form.addRow("分屏镜头", self.multi_stable_box)
 
         self.no_person_combo = QComboBox()
         self.no_person_combo.setToolTip(NO_PERSON_TOOLTIP)
@@ -242,6 +271,7 @@ class RatioPage(QWidget):
         return {
             **self._follow_values,
             "min_person_height_ratio": self.min_person_slider.value() / 100.0,
+            "min_person_sharpness": self.sharpness_slider.value() / 100.0,
             "headroom": self.headroom_slider.value() / 100.0,
         }
 
@@ -277,6 +307,7 @@ class RatioPage(QWidget):
 
         for slider, name in (
             (self.min_person_slider, "min_person_height_ratio"),
+            (self.sharpness_slider, "min_person_sharpness"),
             (self.headroom_slider, "headroom"),
         ):
             if tuning.get(name) is not None:
@@ -303,6 +334,13 @@ class RatioPage(QWidget):
 
     def set_multi_person(self, enabled: bool) -> None:
         self.multi_person_box.setChecked(bool(enabled))
+
+    def multi_person_stable(self) -> bool:
+        """分屏窗口是否用"稳镜头 + 窗口认人"（每个窗口都按正常速度播放）。"""
+        return self.multi_stable_box.isChecked()
+
+    def set_multi_person_stable(self, enabled: bool) -> None:
+        self.multi_stable_box.setChecked(bool(enabled))
 
     def no_person_mode(self) -> str:
         """没有主要人物时的显示方式（``fit`` / ``tiles`` / ``scan`` / ``center``）。"""
@@ -358,17 +396,26 @@ class RatioPage(QWidget):
     def _sketch_caption(self) -> str:
         """示意图下方的白话说明：每个参数在做什么、往哪调会怎样。"""
         min_ratio = self.min_person_slider.value() / 100.0
+        min_sharpness = self.sharpness_slider.value() / 100.0
         headroom = self.headroom_slider.value() / 100.0
         key = self.follow_key()
         label = CAMERA_PRESETS[key].label if key in CAMERA_PRESETS else "自定义"
-        multi = (
-            "橙色编号框 = 多人分屏时每人一个小窗口。"
-            if self.multi_person()
-            else "「多人分屏」已关闭，只跟一位主角。"
-        )
+        if not self.multi_person():
+            multi = "「多人分屏」已关闭，只跟一位主角。"
+        elif self.multi_person_stable():
+            multi = (
+                "橙色编号框 = 多人分屏时每人一个小窗口；"
+                "分屏镜头已按秒封顶、窗口固定跟人，每个窗口都是正常速度（不会像快进）。"
+            )
+        else:
+            multi = (
+                "橙色编号框 = 多人分屏时每人一个小窗口；"
+                "分屏镜头沿用「镜头跟随」档位，小窗口里画面运动会显得很急。"
+            )
         mode = self.no_person_mode()
         return (
             f"最小占比 {min_ratio:.2f}：比虚线更矮的人算背景，会被忽略；"
+            f"清晰度下限 {min_sharpness:.2f}：被虚化的人（哪怕占比很大）也算背景；"
             f"头顶留白 {headroom:.2f}：半身时头顶到画面上沿的距离，越大头顶越空、人越小；"
             f"镜头跟随「{label}」：曲线越平 = 画面越稳；"
             f"没有人时「{NO_PERSON_LABELS[mode]}」：{NO_PERSON_DESCRIPTIONS[mode]}。{multi}"

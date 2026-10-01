@@ -19,6 +19,7 @@ from .core.layout import (
     MultiPersonPolicy,
     load_multi_person_policy,
 )
+from .core.multi import WindowCamera
 from .core.noperson import (
     DEFAULT_SECONDARY_PERSON_RATIO,
     DEFAULT_TILES_MAX,
@@ -27,11 +28,12 @@ from .core.noperson import (
 from .core.ratio import DEFAULT_RATIO_NAME, AspectRatio, resolve_ratio
 from .core.smoothing import (
     DEFAULT_NO_PERSON_SECONDS,
+    DEFAULT_WINDOW_PAN_SPEED,
     NO_PERSON_MODES,
     SmoothingParams,
 )
 from .core.speaker import DEFAULT_SPEAKER_PARAMS, SpeakerParams
-from .core.subject import DEFAULT_WEIGHTS, SubjectWeights
+from .core.subject import DEFAULT_MIN_PERSON_SHARPNESS, DEFAULT_WEIGHTS, SubjectWeights
 from .utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -74,6 +76,7 @@ _FLOAT_FIELDS = (
     "conf",
     "iou",
     "min_person_height_ratio",
+    "min_person_sharpness",
     "closeup_ratio",
     "halfbody_ratio",
     "closeup_fill",
@@ -98,6 +101,7 @@ _FLOAT_FIELDS = (
     "speaker_weight",
     "speaker_switch_margin",
     "speaker_min_mouth_motion",
+    "multi_person_pan_speed",
 )
 _BOOL_FIELDS = (
     "save_audio",
@@ -115,6 +119,8 @@ _BOOL_FIELDS = (
     "use_keypoints",
     "speaker_tracking",
     "multi_person",
+    "multi_person_stable_camera",
+    "multi_person_seat_lock",
     "no_person_blur",
 )
 _BOOL_TRUE = {"1", "true", "yes", "y", "on", "是", "开"}
@@ -179,6 +185,10 @@ class AppConfig:
     #: 人物过小阈值：bbox 高度 < 画面高度该比例时视为无人物。
     #: 默认 0.73 只把"画面里占比很大的人"当主要人物，背景里的路人 / 小人被忽略。
     min_person_height_ratio: float = 0.73
+    #: 人物清晰度下限（0~1 的比率，算法见 core/sharpness）：低于它的人算"背景人物" ——
+    #: 被镜头虚化的路人、远处海报 / 屏幕里的人即便"看着很大"也不会被当成主要人物。
+    #: 与"够大"是并列条件：两者都达标才算主要人物；0 = 关闭清晰度判定。
+    min_person_sharpness: float = DEFAULT_MIN_PERSON_SHARPNESS
     subject_area_weight: float = DEFAULT_WEIGHTS.area
     subject_center_weight: float = DEFAULT_WEIGHTS.center
     subject_continuity_weight: float = DEFAULT_WEIGHTS.continuity
@@ -215,6 +225,15 @@ class AppConfig:
     #: 多人布局表（YAML）；``None`` = 用默认路径 configs/multi_person_layout.yaml，
     #: 找不到该文件时使用内置默认布局，不会影响正常出片
     multi_person_layout_file: Path | None = None
+    #: 分屏窗口是否用"稳镜头"：每个小窗口只有一格大、放大倍数高，整幅画面里
+    #: "跟得紧"的镜头放到小窗口里就变成了飞快地平移 / 推拉（看着像快进）。
+    #: 打开后窗口镜头改为"按秒封顶 + 死区更大 + 更柔和"，换人时直接切镜头不横扫。
+    multi_person_stable_camera: bool = True
+    #: 稳镜头的平移上限：**每秒最多平移"窗口自身的几倍"**（越小越稳，0.1~2.0）
+    multi_person_pan_speed: float = DEFAULT_WINDOW_PAN_SPEED
+    #: 分屏窗口是否"认人"：人物一旦入座就固定待在自己的窗口，不因为说话人变化 /
+    #: 位置微动而跟别人换窗口（关掉 = 每个关键帧按说话人 / 空间顺序重排窗口）
+    multi_person_seat_lock: bool = True
 
     # ------------------------------------------------- M1-3：构图分档
     closeup_ratio: float = DEFAULT_FRAMING_PARAMS.closeup_ratio
@@ -242,7 +261,10 @@ class AppConfig:
     smoothing_max_speed: float = 0.05
     #: 加速平滑 (0, 1]：越小起步越柔和，1 = 不限制加速度
     smoothing_accel: float = 0.5
-    #: 丢失目标后保持上一帧取景框的最大帧数
+    #: 丢失目标后保持上一帧取景框的最大帧数。
+    #: 多人分屏时它还有第二个作用：漏检的人**保留窗口**多少帧（这几帧窗口不动、
+    #: 画面继续播放），以及撤掉一个分屏窗口 / 退出分屏要等多少帧才生效 ——
+    #: 调大 = 人数抖动时更不容易闪；调小 = 人一少就立刻改布局。
     hold_frames: int = 30
     #: 空镜巡视的单程时长（秒）：只有显示方式为 ``scan`` 时才用得上。
     #: 取景框从中线性地平移扫过整幅画面，而不是直接居中 —— 直接居中会一次性丢掉
@@ -444,6 +466,14 @@ class AppConfig:
             order=order,
         )
 
+    def window_camera(self) -> WindowCamera:
+        """分屏小窗口的镜头策略（"每个窗口都正常速度播放"，见 ``core.multi``）。"""
+        return WindowCamera(
+            stable=bool(self.multi_person_stable_camera),
+            pan_speed=float(self.multi_person_pan_speed),
+            seat_lock=bool(self.multi_person_seat_lock),
+        )
+
     def output_path_for(self, source: str | Path) -> Path:
         """按 M0 决策推导某个源视频的输出路径。"""
         return default_output_path(
@@ -496,6 +526,10 @@ class AppConfig:
             raise ValueError(
                 f"min_person_height_ratio 必须在 [0, 1] 区间内，当前为 {self.min_person_height_ratio}"
             )
+        if not 0.0 <= float(self.min_person_sharpness) <= 1.0:
+            raise ValueError(
+                f"min_person_sharpness 必须在 [0, 1] 区间内，当前为 {self.min_person_sharpness}"
+            )
         if (self.target_width is None) != (self.target_height is None):
             raise ValueError("target_width 与 target_height 必须同时给出")
         if self.output_suffix is not None and not str(self.output_suffix).startswith("."):
@@ -513,6 +547,11 @@ class AppConfig:
         if str(self.multi_person_order).strip().lower() not in {"spatial", "score"}:
             raise ValueError(
                 f"multi_person_order 只能是 spatial 或 score，当前为 {self.multi_person_order!r}"
+            )
+        if not 0.05 <= float(self.multi_person_pan_speed) <= 5.0:
+            raise ValueError(
+                "multi_person_pan_speed 必须在 [0.05, 5.0] 区间内"
+                f"（每秒最多平移几个窗口宽度），当前为 {self.multi_person_pan_speed}"
             )
         # 布局文件提前解析一次：配置写错（网格不合法 / 人数与格子数不符）在这里就报出来
         self.multi_person_policy()

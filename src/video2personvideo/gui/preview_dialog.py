@@ -35,6 +35,7 @@ from ..core.layout import TransitionFrame, fit_rect
 from ..core.multi import plan_static_multi
 from ..core.noperson import TilesPlanner, whole_frame_box
 from ..core.ratio import AspectRatio
+from ..core.sharpness import annotate_sharpness
 from ..core.smoothing import (
     CAMERA_PRESETS,
     DEFAULT_NO_PERSON_MODE,
@@ -45,7 +46,11 @@ from ..core.smoothing import (
     no_person_mode_label,
     preset_values,
 )
-from ..core.subject import Detection, select_subject
+from ..core.subject import (
+    DEFAULT_MIN_PERSON_SHARPNESS,
+    Detection,
+    select_subject,
+)
 from ..core.video_io import VideoReader
 from . import theme
 from .pages.ratio_page import (
@@ -151,6 +156,7 @@ class PreviewDialog(QDialog):
         self._render_params = {
             **self._follow_values,
             "min_person_height_ratio": cfg.min_person_height_ratio,
+            "min_person_sharpness": cfg.min_person_sharpness,
             "headroom": cfg.headroom,
             "multi_person": bool(cfg.multi_person),
         }
@@ -209,6 +215,17 @@ class PreviewDialog(QDialog):
         )
         form.addRow("人物最小占比", person_row)
 
+        sharpness = float(
+            self._render_params.get("min_person_sharpness", DEFAULT_MIN_PERSON_SHARPNESS)
+        )
+        self.sharpness_slider, sharpness_row = self._slider(0, 100, int(round(sharpness * 100)))
+        self.sharpness_slider.setToolTip(
+            "人物清晰度下限：与「人物最小占比」并列，两者都达标才算主要人物。\n"
+            "被镜头虚化的人（背景里的路人、远处海报 / 屏幕里的人）即便占比很大，\n"
+            "清晰度不达标也会被当成背景人物。默认 0.30；0 = 关闭这项判定。"
+        )
+        form.addRow("人物清晰度下限", sharpness_row)
+
         self.headroom_slider, headroom_row = self._slider(
             0, 30, int(self._render_params["headroom"] * 100)
         )
@@ -253,6 +270,7 @@ class PreviewDialog(QDialog):
         return {
             **self._follow_values,
             "min_person_height_ratio": self.person_slider.value() / 100.0,
+            "min_person_sharpness": self.sharpness_slider.value() / 100.0,
             "headroom": self.headroom_slider.value() / 100.0,
         }
 
@@ -279,6 +297,12 @@ class PreviewDialog(QDialog):
 
     @Slot(object)
     def _on_samples(self, samples: list[dict]) -> None:
+        # 清晰度只跟"帧 + 人物框"有关、与阈值无关：先算一次存进样本里，
+        # 之后拖动滑块重算构图就不必重复算 Laplacian。
+        for sample in samples:
+            sample["detections"] = annotate_sharpness(
+                sample["frame"], sample["detections"]
+            )
         self._samples = samples
         self._teardown()
         self.status_label.setText(
@@ -370,6 +394,7 @@ class PreviewDialog(QDialog):
         detections = sample["detections"]
         frame_size = (float(frame.shape[1]), float(frame.shape[0]))
         min_person_ratio = cfg.min_person_height_ratio
+        min_person_sharpness = cfg.min_person_sharpness
 
         windows: list[WindowSlice] | None = (
             plan_static_multi(
@@ -379,6 +404,7 @@ class PreviewDialog(QDialog):
                 params=params,
                 policy=policy,
                 min_person_height_ratio=min_person_ratio,
+                min_person_sharpness=min_person_sharpness,
             )
             if policy is not None
             else None
@@ -397,6 +423,7 @@ class PreviewDialog(QDialog):
                 frame_size,
                 weights=weights,
                 min_height_ratio=min_person_ratio,
+                min_sharpness=min_person_sharpness,
             )
             if subject is None:
                 # 没有主要人物：按"没有人物时"的档位预览（整幅画面 / 全景 + 特写）

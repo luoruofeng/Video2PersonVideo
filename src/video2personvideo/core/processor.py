@@ -332,12 +332,14 @@ def process_video(
             smoother=BoxSmoother(ratio, params=cfg.smoothing_params()),
             weights=cfg.subject_weights(),
             min_person_height_ratio=cfg.min_person_height_ratio,
+            min_person_sharpness=cfg.min_person_sharpness,
             detect_interval=cfg.detect_interval,
             infer_batch=cfg.infer_batch,
             crop=True,
             annotate=cfg.annotate,
             multi=multi_policy,
             no_person=cfg.no_person_display(),
+            window_camera=cfg.window_camera(),
         )
 
     # 先探测源视频的音频 / 视频信息：可变帧率（VFR）时把画面归一到恒定帧率，
@@ -601,9 +603,10 @@ def _describe_multi(pipeline: CropPipeline | None, frames: int) -> str:
         return "未启用（画框标注模式）"
     if pipeline.composer is None:
         return "未启用（配置关闭，整段视频同时只显示一个人）"
+    camera = pipeline.composer.camera.describe()
     if frames > 0:
-        return "已启用（多个主要人物各占一个上半身小窗口）"
-    return "已启用（本片未出现多个主要人物，画面与单人模式一致）"
+        return f"已启用（多个主要人物各占一个上半身小窗口；{camera}）"
+    return f"已启用（本片未出现多个主要人物，画面与单人模式一致；{camera}）"
 
 
 def _describe_no_person(pipeline: CropPipeline | None) -> str:

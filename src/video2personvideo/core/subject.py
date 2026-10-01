@@ -22,6 +22,11 @@ BBox = tuple[float, float, float, float]
 #: :data:`~video2personvideo.core.framing.DEFAULT_MIN_PERSON_HEIGHT_RATIO` 保持一致。
 DEFAULT_MIN_HEIGHT_RATIO = 0.73
 
+#: 默认主角最低清晰度（0~1 的比率，算法见 :mod:`~video2personvideo.core.sharpness`）：
+#: 低于它的人算"背景人物" —— 被镜头虚化的路人、远处海报 / 屏幕里的人即便"看着很大"，
+#: 也不会被当成主要人物。与"够大"是**并列**条件，两者都达标才算主要人物。
+DEFAULT_MIN_PERSON_SHARPNESS = 0.30
+
 
 @dataclass(frozen=True, slots=True)
 class Detection:
@@ -32,6 +37,9 @@ class Detection:
     class_id: int = 0
     #: COCO-17 姿态关键点（仅姿态模型提供；用于精修构图锚点）
     keypoints: Keypoints | None = None
+    #: 人物框内的清晰度比率（0~1，算法见 :mod:`~video2personvideo.core.sharpness`）。
+    #: ``None`` = 还没算过（视为达标，不参与过滤），由流水线在检测后补上。
+    sharpness: float | None = None
 
     @property
     def width(self) -> float:
@@ -91,18 +99,38 @@ def iou(first: BBox, second: BBox) -> float:
     return inter / union if union > 0 else 0.0
 
 
+def passes_sharpness(detection: Detection, min_sharpness: float = 0.0) -> bool:
+    """清晰度是否达标（"够清晰"这一半的判定）。
+
+    ``detection.sharpness`` 为 ``None``（没算过 / 无法判定）时一律**放行**，
+    于是没接清晰度判定的调用方（单测、画框标注模式）行为与以前完全一致。
+    """
+    floor = max(float(min_sharpness), 0.0)
+    if floor <= 0.0 or detection.sharpness is None:
+        return True
+    return float(detection.sharpness) >= floor
+
+
 def filter_small(
     detections: Iterable[Detection],
     frame_size: tuple[float, float],
     min_height_ratio: float = DEFAULT_MIN_HEIGHT_RATIO,
+    min_sharpness: float = 0.0,
 ) -> list[Detection]:
-    """过滤掉"人物过小"的检测，剩下的才视为有效人物。"""
+    """过滤掉"人物过小"或"画面够糊"的检测，剩下的才视为有效人物。
+
+    "够大"与"够清晰"是**并列**条件：高度不达标的人（背景里的路人 / 小人）与
+    清晰度不达标的人（被虚化的背景人物）都不算主要人物。
+    """
     frame_h = float(frame_size[1]) if frame_size else 0.0
     threshold = max(min_height_ratio, 0.0) * frame_h
     return [
         item
         for item in detections
-        if item.width > 0 and item.height > 0 and item.height >= threshold
+        if item.width > 0
+        and item.height > 0
+        and item.height >= threshold
+        and passes_sharpness(item, min_sharpness)
     ]
 
 
@@ -153,15 +181,20 @@ def select_subject(
     prev_bbox: BBox | None = None,
     weights: SubjectWeights = DEFAULT_WEIGHTS,
     min_height_ratio: float = DEFAULT_MIN_HEIGHT_RATIO,
+    min_sharpness: float = 0.0,
     bonuses: Mapping[BBox, float] | None = None,
 ) -> Detection | None:
     """选出"主要人物"；过滤后无人时返回 ``None``（交由兜底策略处理）。
+
+    ``min_height_ratio`` 与 ``min_sharpness`` 是并列的两道门槛：人物既要**够大**，
+    也要**够清晰**（清晰度由 :func:`~video2personvideo.core.sharpness.annotate_sharpness`
+    预先算进 ``Detection.sharpness``），任一不达标即视为背景人物。
 
     ``bonuses`` 是以人物框为键的额外偏置（说话人跟随用），量纲与常规得分一致（0~1）：
     命中的检测加上对应分值后，``≥ 1.0`` 的偏置足以让"正在说话的人"压过
     "个子更大 / 更居中 / 时序更连续"的人；比 1.0 小的偏置则是"软优先"。
     """
-    candidates = filter_small(detections, frame_size, min_height_ratio)
+    candidates = filter_small(detections, frame_size, min_height_ratio, min_sharpness)
     if not candidates:
         return None
 

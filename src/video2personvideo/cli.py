@@ -119,7 +119,12 @@ def build_parser() -> argparse.ArgumentParser:
         dest="smoothing_max_speed",
         help="镜头平移速度上限（相对框长/帧），防止甩镜；0 = 不限制",
     )
-    crop_group.add_argument("--hold-frames", type=int, dest="hold_frames", help="丢失目标后保持取景框的帧数")
+    crop_group.add_argument(
+        "--hold-frames",
+        type=int,
+        dest="hold_frames",
+        help="丢失目标后保持取景框的帧数（分屏时也是「漏检的人保留窗口 / 撤窗口」的帧数）",
+    )
     crop_group.add_argument(
         "--no-person-mode",
         choices=list(NO_PERSON_MODES),
@@ -167,6 +172,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     crop_group.add_argument("--min-person-ratio", type=float, dest="min_person_height_ratio", help="人物过小阈值（bbox 高 / 画面高）")
+    crop_group.add_argument(
+        "--min-sharpness",
+        type=float,
+        dest="min_person_sharpness",
+        help=(
+            "主要人物的清晰度下限（0~1 比率，与「够大」并列）：低于它的人算背景人物"
+            "（被虚化的路人 / 远处海报里的人），默认 0.30；0 = 关闭清晰度判定"
+        ),
+    )
     crop_group.add_argument("--headroom", type=float, help="半身构图的头顶留白比例")
     crop_group.add_argument(
         "--speaker-tracking",
@@ -220,13 +234,41 @@ def build_parser() -> argparse.ArgumentParser:
         "--multi-person-order",
         choices=["spatial", "score"],
         dest="multi_person_order",
-        help="多人分屏的人物排列：spatial = 先说话人、其余按画面位置；score = 完全按主角打分",
+        help=(
+            "多人分屏的人物排列（决定新人入座顺序）：spatial = 先说话人、其余按画面位置；"
+            "score = 完全按主角打分。默认还开着 --multi-person-seat-lock，人物入座后不再换窗口"
+        ),
     )
     crop_group.add_argument(
         "--layout-config",
         type=Path,
         dest="multi_person_layout_file",
         help="多人分屏的布局表配置（默认 configs/multi_person_layout.yaml，缺失时用内置布局）",
+    )
+    crop_group.add_argument(
+        "--multi-person-stable-camera",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "分屏小窗口用「稳镜头」：平移 / 缩放按秒封顶、死区更大、换人就位不横扫"
+            "（--no-multi-person-stable-camera 关闭 = 沿用镜头跟随档位，小窗口里会比较急；默认开启）"
+        ),
+    )
+    crop_group.add_argument(
+        "--multi-person-pan-speed",
+        type=float,
+        dest="multi_person_pan_speed",
+        help="稳镜头的平移上限：每秒最多平移「窗口自身的几倍」（0.05~5.0，越小越稳）",
+    )
+    crop_group.add_argument(
+        "--multi-person-seat-lock",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "分屏窗口「认人」：人物一旦入座就固定待在自己的窗口，"
+            "不因说话人变化 / 位置微动而跟别人换窗口"
+            "（--no-multi-person-seat-lock 关闭 = 每个关键帧按说话人 / 位置重排；默认开启）"
+        ),
     )
 
     output_group = parser.add_argument_group("输出")
@@ -442,6 +484,7 @@ def _override_kwargs(args: argparse.Namespace) -> dict[str, object]:
         "no_person_tiles_max": args.no_person_tiles_max,
         "no_person_secondary_ratio": args.no_person_secondary_ratio,
         "min_person_height_ratio": args.min_person_height_ratio,
+        "min_person_sharpness": args.min_person_sharpness,
         "headroom": args.headroom,
         "speaker_tracking": args.speaker_tracking,
         "speaker_weight": args.speaker_weight,
@@ -452,6 +495,9 @@ def _override_kwargs(args: argparse.Namespace) -> dict[str, object]:
         "multi_person_max": args.multi_person_max,
         "multi_person_order": args.multi_person_order,
         "multi_person_layout_file": args.multi_person_layout_file,
+        "multi_person_stable_camera": args.multi_person_stable_camera,
+        "multi_person_pan_speed": args.multi_person_pan_speed,
+        "multi_person_seat_lock": args.multi_person_seat_lock,
         "output_suffix": args.output_suffix,
         "output_same_dir": args.same_dir,
         "overwrite": args.overwrite,

@@ -40,10 +40,11 @@ from .framing import (
 )
 from .layout import DEFAULT_MULTI_PERSON_POLICY, MultiPersonPolicy
 from .mouth import FaceLocator, MouthActivityAnalyzer
-from .multi import MultiPersonComposer, MultiPlan
+from .multi import MultiPersonComposer, MultiPlan, WindowCamera
 from .noperson import NoPersonDisplay, TilesPlanner
 from .pose import build_anchors
 from .ratio import AspectRatio
+from .sharpness import annotate_sharpness
 from .smoothing import BoxSmoother
 from .speaker import ActiveSpeakerSelector
 from .subject import DEFAULT_WEIGHTS, SubjectWeights, filter_small, select_subject
@@ -130,6 +131,7 @@ class CropPipeline:
         smoother: BoxSmoother | None = None,
         weights: SubjectWeights = DEFAULT_WEIGHTS,
         min_person_height_ratio: float = DEFAULT_MIN_PERSON_HEIGHT_RATIO,
+        min_person_sharpness: float = 0.0,
         detect_interval: int = 1,
         infer_batch: int = 1,
         crop: bool = True,
@@ -139,12 +141,16 @@ class CropPipeline:
         speaker_weight: float = 0.0,
         multi: MultiPersonPolicy | None = None,
         no_person: NoPersonDisplay | None = None,
+        window_camera: WindowCamera | None = None,
     ) -> None:
         self.ratio = ratio
         self.detector = detector
         self.params = params
         self.weights = weights
         self.min_person_height_ratio = float(min_person_height_ratio)
+        #: 主要人物的清晰度下限（与"够大"并列的第二道门槛，见 ``core.sharpness``）：
+        #: 0 = 不启用（画面里人物的清晰度不参与判定）
+        self.min_person_sharpness = max(float(min_person_sharpness), 0.0)
         self.detect_interval = max(int(detect_interval), 1)
         self.infer_batch = max(int(infer_batch), 1)
         self.crop = bool(crop)
@@ -171,7 +177,9 @@ class CropPipeline:
                 weights=weights,
                 policy=self.multi_policy,
                 min_person_height_ratio=self.min_person_height_ratio,
+                min_person_sharpness=self.min_person_sharpness,
                 annotate=self.annotate,
+                camera=window_camera,
             )
             if self.multi_policy is not None
             else None
@@ -313,6 +321,15 @@ class CropPipeline:
             detections = results[result_index]
             result_index += 1
             frame_size = (float(frame.shape[1]), float(frame.shape[0]))
+            # 主要人物的第二道门槛：清晰度。为"够大、有可能成为主要人物"的检测
+            # 算出清晰度比率（过小的人反正会被高度阈值滤掉，不必花时间）。
+            if self.min_person_sharpness > 0.0:
+                detections = annotate_sharpness(
+                    frame,
+                    detections,
+                    frame_size=frame_size,
+                    min_height_ratio=self.min_person_height_ratio,
+                )
             count = len(detections)
             self.stats.detected_frames += 1
 
@@ -336,6 +353,7 @@ class CropPipeline:
                     prev_bbox=self._prev_bbox,
                     weights=self.weights,
                     min_height_ratio=self.min_person_height_ratio,
+                    min_sharpness=self.min_person_sharpness,
                     bonuses=bonuses,
                 )
                 target = (
@@ -394,7 +412,9 @@ class CropPipeline:
         if not self.speaker.enabled:
             return None
 
-        candidates = filter_small(detections, frame_size, self.min_person_height_ratio)
+        candidates = filter_small(
+            detections, frame_size, self.min_person_height_ratio, self.min_person_sharpness
+        )
         if len(candidates) < 2:
             # 只有一个人（或人都太小）：不判定说话人，但仍然要把嘴动分析器的
             # "上一帧"基准推进到本帧。否则基准会停留在好几帧之前，等下一个人

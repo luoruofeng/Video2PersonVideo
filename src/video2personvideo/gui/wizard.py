@@ -74,6 +74,7 @@ class WizardWindow(QMainWindow):
         self.ratio_page.set_size_guard(self._base_cfg.size_guard)
         self.ratio_page.set_speaker_tracking(self._base_cfg.speaker_tracking)
         self.ratio_page.set_multi_person(self._base_cfg.multi_person)
+        self.ratio_page.set_multi_person_stable(self._base_cfg.multi_person_stable_camera)
         self.ratio_page.set_no_person_mode(self._base_cfg.no_person_mode)
 
         self.stack = QStackedWidget()
@@ -206,6 +207,9 @@ class WizardWindow(QMainWindow):
             size_guard=self.ratio_page.size_guard(),
             speaker_tracking=self.ratio_page.speaker_tracking(),
             multi_person=self.ratio_page.multi_person(),
+            # 「分屏窗口稳定跟随」一个开关同时管两件事：镜头按秒封顶 + 窗口固定跟人
+            multi_person_stable_camera=self.ratio_page.multi_person_stable(),
+            multi_person_seat_lock=self.ratio_page.multi_person_stable(),
             no_person_mode=self.ratio_page.no_person_mode(),
             show=False,
             **tuning,
@@ -338,6 +342,8 @@ class WizardWindow(QMainWindow):
             # 用 contains 判断"有没有记忆过"：直接把默认值写成 None 会被 Qt 转成 False
             has_multi_person = bool(settings.contains("multi/person"))
             multi_person = bool(settings.value("multi/person", True, type=bool))
+            has_multi_stable = bool(settings.contains("multi/stable"))
+            multi_stable = bool(settings.value("multi/stable", True, type=bool))
             has_no_person = bool(settings.contains("noPerson/mode"))
             no_person_mode = str(settings.value("noPerson/mode", "", type=str))
         except Exception as exc:  # noqa: BLE001 - 没有配置后端时忽略
@@ -353,6 +359,8 @@ class WizardWindow(QMainWindow):
         # 没记忆过就沿用配置默认值（默认开启），只覆盖用户真正选过的
         if has_multi_person:
             self.ratio_page.set_multi_person(multi_person)
+        if has_multi_stable:
+            self.ratio_page.set_multi_person_stable(multi_stable)
         if has_no_person and no_person_mode:
             self.ratio_page.set_no_person_mode(no_person_mode)
 
@@ -373,6 +381,7 @@ class WizardWindow(QMainWindow):
             settings.setValue("ratio/width", ratio.target_width)
             settings.setValue("ratio/height", ratio.target_height)
             settings.setValue("multi/person", self.ratio_page.multi_person())
+            settings.setValue("multi/stable", self.ratio_page.multi_person_stable())
             settings.setValue("noPerson/mode", self.ratio_page.no_person_mode())
             settings.sync()
         except Exception as exc:  # noqa: BLE001

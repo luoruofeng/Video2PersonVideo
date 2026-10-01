@@ -115,6 +115,32 @@ REFERENCE_FPS = 30.0
 #: 不值得巡视（否则取景框会在几像素内来回抖，比静止更难看）。
 SCAN_MIN_SPAN_PX = 8.0
 
+# ------------------------------------------------------------------ 分屏小窗口
+#: 多人分屏每个小窗口的镜头平移上限：**屏幕**上每秒最多平移"窗口自身的几倍"。
+#:
+#: 单窗口模式的速度上限是按"相对框长 / 帧"标定的（跟手档 = 5%/帧 = 1.5 个框宽/秒，
+#: 人物越界时还会放大到 4 倍 = 6 个框宽/秒）：整幅画面里这只是"跟得紧"，但分屏窗口
+#: 只有一格大、放大倍数高，同样的相对速度在屏幕上非常显眼 —— 看上去就是"画面在快进"。
+#: 因此分屏窗口一律改用**按秒**标定，并且几乎不因人物跑远而加速（见
+#: :func:`window_smoothing_params`）。
+DEFAULT_WINDOW_PAN_SPEED = 0.5
+
+#: 分屏窗口的自由活动区相对用户档位的倍数与下限（更"懒"：人物在窗口里晃动时镜头不动）
+WINDOW_DEADZONE_SCALE = 2.0
+WINDOW_MIN_DEADZONE = 0.15
+#: 分屏窗口的缩放死区倍数与下限（压住小窗口里的"呼吸式变焦"）
+WINDOW_ZOOM_DEADZONE_SCALE = 2.0
+WINDOW_MIN_ZOOM_DEADZONE = 0.12
+#: 分屏窗口的平滑 / 缩放 / 加速度系数相对用户档位的倍数（比单窗口更柔和）
+WINDOW_ALPHA_SCALE = 0.55
+WINDOW_ZOOM_ALPHA_SCALE = 0.5
+WINDOW_ACCEL_SCALE = 0.7
+#: 分屏窗口的"越界追赶"上限：人物快走出窗口时镜头最多快到这个倍数
+#: （单窗口是 :data:`MAX_SPEED_FACTOR` = 4 倍，这里只到 1.6 倍，不会甩镜）
+WINDOW_MAX_SPEED_FACTOR = 1.6
+#: 分屏窗口的追赶系数（越小越"无动于衷"，只把人物推回窗口内）
+WINDOW_CATCHUP = 2.0
+
 #: 空镜巡视的默认单程时长（秒）：从画面一端平缓移到另一端用多久。
 #: 12 秒 ≈ 6px/帧（1080p 横屏转竖屏实测），慢到看不出"被裁"，又能在
 #: 一段十几秒的空镜里看完整个画面宽度。
@@ -154,6 +180,11 @@ class SmoothingParams:
     #: 源视频帧率；给出时把上面这些"每帧"参数换算成与帧率无关的等效值
     #: （``None`` = 不换算，即把源视频当作 :data:`REFERENCE_FPS`）
     fps: float | None = None
+    #: "追赶系数"：人物偏离越大，速度上限放宽得越快（见 :func:`_speed_limit`）。
+    #: 分屏小窗口用更小的值（不轻易加速），单人模式保持 :data:`CATCHUP`。
+    catchup: float = CATCHUP
+    #: 速度上限相对 ``max_speed`` 的最大倍数（``1.0`` = 无论偏多远都不加速）
+    max_speed_factor: float = MAX_SPEED_FACTOR
 
     def __post_init__(self) -> None:
         if not 0.0 < float(self.alpha) <= 1.0:
@@ -170,6 +201,12 @@ class SmoothingParams:
             raise ValueError(f"accel 必须在 (0, 1] 区间内，当前为 {self.accel}")
         if int(self.hold_frames) < 0:
             raise ValueError(f"hold_frames 不能为负，当前为 {self.hold_frames}")
+        if float(self.catchup) < 0.0:
+            raise ValueError(f"catchup 不能为负，当前为 {self.catchup}")
+        if float(self.max_speed_factor) < 1.0:
+            raise ValueError(
+                f"max_speed_factor 不能小于 1（1 = 不加速），当前为 {self.max_speed_factor}"
+            )
         if float(self.scan_seconds) < 0.0:
             raise ValueError(f"scan_seconds 不能为负（0 = 关闭空镜巡视），当前为 {self.scan_seconds}")
         mode = str(self.no_person_mode).strip().lower()
@@ -345,18 +382,70 @@ def _phase_for_offset(offset: float, span: float) -> float:
     return math.acos(1.0 - 2.0 * position) / (2.0 * math.pi)
 
 
-def _speed_limit(offset: float, size: float, max_speed: float) -> float:
+def _speed_limit(
+    offset: float,
+    size: float,
+    max_speed: float,
+    catchup: float = CATCHUP,
+    max_factor: float = MAX_SPEED_FACTOR,
+) -> float:
     """本帧允许的最大步长：基准速度上限 × 越界放大倍数（平滑饱和，不甩镜）。
 
-    小偏离处斜率为 :data:`CATCHUP`（和线性放宽一样"跟得住"），大偏离处平滑饱和到
-    :data:`MAX_SPEED_FACTOR` 倍 —— 人物跑起来时镜头变快但不"炸"，避免急促横摇。
+    小偏离处斜率为 ``catchup``（和线性放宽一样"跟得住"），大偏离处平滑饱和到
+    ``max_factor`` 倍 —— 人物跑起来时镜头变快但不"炸"，避免急促横摇。
+    分屏小窗口用更小的 ``catchup`` / ``max_factor``（见 :func:`window_smoothing_params`）。
     """
     if max_speed <= 0.0 or size <= 0.0:
         return math.inf
-    headroom = max(MAX_SPEED_FACTOR - 1.0, 0.0)
+    headroom = max(float(max_factor) - 1.0, 0.0)
     exceed = abs(offset) / size
-    factor = 1.0 if headroom <= 0.0 else 1.0 + headroom * math.tanh(CATCHUP * exceed / headroom)
+    if headroom <= 0.0 or float(catchup) <= 0.0:
+        return max_speed * size
+    factor = 1.0 + headroom * math.tanh(catchup * exceed / headroom)
     return max_speed * size * factor
+
+
+def window_smoothing_params(
+    base: SmoothingParams,
+    *,
+    pan_speed: float = DEFAULT_WINDOW_PAN_SPEED,
+) -> SmoothingParams:
+    """多人分屏小窗口**专用**的镜头参数（纯函数，由用户档位推导）。
+
+    单窗口的镜头是按"整幅画面"标定的：跟手档下平移上限是 **1.5 个框宽/秒**，人物偏离
+    边界时还会一路放宽到 **4 倍（= 6 个框宽/秒）**。整幅画面里这只是"跟得紧"，但分屏
+    窗口只有一格大、放大倍数高，同样的相对速度在屏幕上的位移被放得很好看 ——
+    人物在窗口里稍有动作，镜头就飞快地平移 / 推拉，看着像"画面在快进"。
+
+    因此分屏窗口换成一套"正常速度"的镜头：
+
+    1. **按秒封顶**（``pan_speed``）：平移与缩放都统一成"每秒最多移动窗口自身的
+       ``pan_speed`` 倍"，与帧率无关；并且几乎不因人物偏离而加速
+       （``max_speed_factor = :data:`WINDOW_MAX_SPEED_FACTOR`，只有单窗口的一半不到），
+       于是镜头永远是同一个慢速，不会甩；
+    2. **更懒**：自由活动区放大到两倍以上（不低于 :data:`WINDOW_MIN_DEADZONE`）——
+       人物在窗口里说话、晃动时镜头**完全不动**，只有快到窗口边缘才平移；
+    3. **更柔和**：平滑 / 缩放 / 加速度系数按比例减小，起步与收尾都不急。
+
+    只改镜头运动，不动构图：取景框的比例与尺寸算法与单窗口完全一致。
+    """
+    speed = float(pan_speed)
+    if not speed > 0.0:
+        speed = DEFAULT_WINDOW_PAN_SPEED
+    return replace(
+        base,
+        alpha=float(base.alpha) * WINDOW_ALPHA_SCALE,
+        deadzone=max(float(base.deadzone) * WINDOW_DEADZONE_SCALE, WINDOW_MIN_DEADZONE),
+        zoom_alpha=float(base.zoom_alpha) * WINDOW_ZOOM_ALPHA_SCALE,
+        zoom_deadzone=max(
+            float(base.zoom_deadzone) * WINDOW_ZOOM_DEADZONE_SCALE, WINDOW_MIN_ZOOM_DEADZONE
+        ),
+        # "每秒 pan_speed 个窗口"换算成"每个基准帧多少"：_apply_fps 会再按真实帧率折算
+        max_speed=min(float(base.max_speed), speed / REFERENCE_FPS),
+        accel=float(base.accel) * WINDOW_ACCEL_SCALE,
+        catchup=WINDOW_CATCHUP,
+        max_speed_factor=WINDOW_MAX_SPEED_FACTOR,
+    )
 
 
 class BoxSmoother:
@@ -525,6 +614,14 @@ class BoxSmoother:
         self.params = replace(self.params, fps=None if fps is None else float(fps))
         self._apply_fps()
 
+    def set_params(self, params: SmoothingParams) -> None:
+        """整体替换平滑参数（分屏窗口换成"更稳"的一套时用）。
+
+        只换镜头参数，**位置 / 速度 / 帧计数状态全部保留**：切换后画面不会跳。
+        """
+        self.params = params
+        self._apply_fps()
+
     def _apply_fps(self) -> None:
         """把"每秒感受"标定的参数换算成当前帧率下的等效每帧值。"""
         scale = _time_scale(self.params.fps)
@@ -671,6 +768,30 @@ class BoxSmoother:
         self._box = box.fit_to(frame_w, frame_h)
         return self._box
 
+    def snap_to(self, target: CropBox | None, frame_size: tuple[float, float]) -> CropBox:
+        """把取景框**直接就位**：不做平滑、不横扫，速度归零（"换人就位"用）。
+
+        平滑器会把"离目标很远"处理成一段较长的镜头运动 —— 分屏窗口换人时，那就是
+        整块画面从旧人物快速扫到新人物，观众看到的就是"画面在快进"。换人时观众
+        期待的是"切镜头"，所以这里直接把框放到目标位置（本帧即到位）。
+
+        ``target`` 为空（本帧没有人物）时退回 :meth:`update` 的兜底逻辑。
+        """
+        if target is None:
+            return self.update(None, frame_size)
+
+        frame_w, frame_h = float(frame_size[0]), float(frame_size[1])
+        self.frames += 1
+        self._missing = 0
+        self._ever_had_target = True
+        self._vx = self._vy = self._vh = 0.0
+        self._scan_phase = _SCAN_IDLE
+        self._fit_progress = 0.0
+        self._fit_from = None
+        self._fit_transition = None
+        self._box = target.fit_to(frame_w, frame_h)
+        return self._box
+
     # ------------------------------------------------------------- 内部逻辑
     def fit_transition(
         self,
@@ -783,7 +904,9 @@ class BoxSmoother:
         :param zone: 自由活动区（像素），小于它时完全不动
         """
         offset = _soft_zone(target - current, zone)
-        limit = _speed_limit(offset, size, self._speed_cap)
+        limit = _speed_limit(
+            offset, size, self._speed_cap, self.params.catchup, self.params.max_speed_factor
+        )
         step = min(max(alpha * offset, -limit), limit)
 
         if step * previous_step > 0.0 and abs(step) < abs(previous_step):
